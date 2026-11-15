@@ -78,7 +78,7 @@ def apply() -> dict:
         _run(["git", "merge-base", "--is-ancestor", info["commit"], f"origin/{info['branch']}"], timeout=30)
         _run(["git", "pull", "--ff-only", "origin", info["branch"]], env=env, timeout=300)
         new_commit = _run(["git", "rev-parse", "HEAD"])
-        _state.update(phase="restart_required", message="代码已更新，请重启平台服务", commit=new_commit)
+        _state.update(phase="restart_required", message="代码已更新，正在准备重启", commit=new_commit)
         return {"ok": True, "restart_required": True, "commit": new_commit}
     except Exception:
         _state.update(phase="failed", message="更新失败，查看错误后重试")

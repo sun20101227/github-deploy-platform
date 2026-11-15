@@ -1,0 +1,18 @@
+[Unit]
+Description=Deploy platform
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Replace the user and paths with the actual installation. Run gh auth login as this user.
+User=deploy
+WorkingDirectory=/opt/github-deploy-platform
+EnvironmentFile=/opt/github-deploy-platform/.env
+ExecStart=/opt/github-deploy-platform/.venv/bin/python -m deploy_platform
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

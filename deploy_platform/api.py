@@ -11,14 +11,19 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 from pathlib import Path
 import sqlite3
+import json
+import uuid
+from typing import Literal
 
 from . import db, github, cli_auth, config
 from .deployer import DeploymentError, deploy, rollback
-from . import self_update
+from . import self_update, discovery, runtimes, restart
+from . import deployer
 
 app = FastAPI(title="GitHub Deploy Platform", version="0.1.0")
 db.init()
 oauth_states: set[str] = set()
+INSTANCE = uuid.uuid4().hex
 
 
 @app.middleware("http")
@@ -47,6 +52,13 @@ class ProjectCreate(BaseModel):
     start_command: str
     healthcheck_url: str = ""
     webhook_secret: str = ""
+    runtime: Literal['command','compose','systemd'] = 'command'
+    runtime_config: dict = Field(default_factory=dict)
+
+    @field_validator('runtime_config', mode='before')
+    @classmethod
+    def parse_runtime_config(cls, value):
+        return json.loads(value) if isinstance(value, str) else value
 
     @field_validator('branch')
     @classmethod
@@ -65,20 +77,9 @@ class ProjectCreate(BaseModel):
             raise ValueError('请选择独立的项目目录')
         return str(target)
 
-    @field_validator('start_command')
-    @classmethod
-    def nonempty_start(cls, value):
-        if not value.strip():
-            raise ValueError('请填写启动命令')
-        return value
-
-
-
-
-
 @app.get("/health")
 def health():
-    return {"ok": True}
+    return {"ok": True, "instance": INSTANCE}
 
 
 @app.get("/auth/github/start")
@@ -133,7 +134,7 @@ def projects():
 
 @app.get("/api/self-update")
 def self_update_status():
-    return self_update.status()
+    return {**self_update.status(), "automatic_restart": restart.supported(), "instance": INSTANCE}
 
 
 @app.post("/api/self-update/check")
@@ -146,22 +147,85 @@ def self_update_check():
 
 @app.post("/api/self-update/apply")
 def self_update_apply():
-    with db.connect() as conn:
-        if conn.execute("SELECT 1 FROM deployments WHERE status IN ('queued','running')").fetchone():
-            raise HTTPException(409, "请等部署任务结束后再更新平台")
+    if not restart.supported():
+        raise HTTPException(409, "请先使用 python -m deploy_platform 启动，更新后才能自动重启")
+    with deployer._guard:
+        if deployer.maintenance.is_set() or any(lock.locked() for lock in deployer._locks.values()):
+            raise HTTPException(409, '请等当前更新任务结束')
+        deployer.maintenance.set()
     try:
-        return self_update.apply()
-    except RuntimeError as exc:
+        result = self_update.apply()
+        restart.schedule()
+        return {**result, "restarting": True, "instance": INSTANCE}
+    except Exception as exc:
+        deployer.maintenance.clear()
         raise HTTPException(409, str(exc)) from exc
+
+
+
+class DiscoveryRequest(BaseModel):
+    root: str
+    depth: int = Field(default=2, ge=0, le=4)
+
+
+class ImportRequest(BaseModel):
+    path: str
+    account_id: int
+    runtime: Literal['command','compose','systemd'] = 'command'
+    runtime_config: dict = Field(default_factory=dict)
+    start_command: str = ''
+    build_command: str = ''
+    healthcheck_url: str = ''
+
+
+@app.post('/api/discovery/scan')
+def scan_local(payload: DiscoveryRequest):
+    try:
+        return discovery.scan(payload.root, payload.depth)
+    except OSError:
+        raise HTTPException(400, '目录不存在或无法读取') from None
+
+
+@app.post('/api/projects/import')
+def import_project(payload: ImportRequest):
+    try:
+        item = discovery.inspect(payload.path)
+    except OSError:
+        raise HTTPException(400, '目录不存在或无法读取') from None
+    if not item['repository'] or not item['branch']:
+        raise HTTPException(400, '需要 GitHub origin 和已检出的本地分支')
+    settings = runtimes.validate(payload.runtime, payload.runtime_config, item['path'])
+    if payload.runtime == 'command' and not payload.start_command.strip():
+        raise HTTPException(400, '请填写现有服务的重启命令')
+    with db.connect() as c:
+        if not c.execute('SELECT 1 FROM github_accounts WHERE id=?',(payload.account_id,)).fetchone():
+            raise HTTPException(404,'GitHub 账号不存在')
+        paths=[Path(r[0]).resolve() for r in c.execute('SELECT deploy_root FROM projects')]
+        root=Path(item['path'])
+        if any(root==p or root.is_relative_to(p) or p.is_relative_to(root) for p in paths):
+            raise HTTPException(409,'目录与已有项目重叠')
+        now=db.now()
+        job=c.execute("INSERT INTO projects(account_id,repository,branch,deploy_root,build_command,start_command,healthcheck_url,webhook_secret,created_at,updated_at,mode,runtime,runtime_config) VALUES (?,?,?,?,?,?,?,?,?,?,'existing',?,?)",
+            (payload.account_id,item['repository'],item['branch'],item['path'],payload.build_command,payload.start_command,payload.healthcheck_url,secrets.token_hex(32),now,now,payload.runtime,json.dumps(settings))).lastrowid
+        c.execute("INSERT INTO deployments(project_id,action,status,commit_sha,release_dir,message,started_at,finished_at) VALUES (?,'import','succeeded',?,?,'已登记当前提交；未修改代码或重启服务',?,?)",(job,item['commit'],item['path'],now,now))
+    return {'id':job}
 
 
 @app.post("/api/projects")
 def create_project(payload: ProjectCreate):
+    if payload.runtime != 'command':
+        raise HTTPException(400, '新建项目请填写包含重启步骤的启动命令')
+    if not payload.start_command.strip():
+        raise HTTPException(400, "请填写启动命令")
     with db.connect() as conn:
         if not conn.execute("SELECT 1 FROM github_accounts WHERE id=?", (payload.account_id,)).fetchone():
             raise HTTPException(404, "GitHub 账号不存在")
-        if conn.execute("SELECT 1 FROM projects WHERE deploy_root=?", (payload.deploy_root,)).fetchone():
-            raise HTTPException(409, "这个部署目录已被其他项目使用")
+        root = Path(payload.deploy_root)
+        paths = [Path(r[0]).resolve() for r in conn.execute('SELECT deploy_root FROM projects')]
+        if any(root == p or root.is_relative_to(p) or p.is_relative_to(root) for p in paths):
+            raise HTTPException(409, "这个部署目录与已有项目重叠")
+        if (root / '.git').exists():
+            raise HTTPException(409, "目录已有 Git 仓库，请从已有项目页面接入")
         timestamp = db.now()
         webhook_secret = payload.webhook_secret or secrets.token_hex(32)
         cursor = conn.execute(
@@ -294,12 +358,16 @@ def project_detail(project_id: int):
 
 @app.put("/api/projects/{project_id}")
 def edit_project(project_id: int, payload: ProjectCreate):
-    project_detail(project_id)
+    project = project_detail(project_id)
+    runtime = payload.runtime if project['mode'] == 'existing' else 'command'
+    settings = runtimes.validate(runtime, payload.runtime_config, project['deploy_root'])
+    if runtime == 'command' and not payload.start_command.strip():
+        raise HTTPException(400, "请填写重启命令")
     with db.connect() as conn:
         if conn.execute("SELECT 1 FROM deployments WHERE project_id=? AND status IN ('queued','running')", (project_id,)).fetchone():
             raise HTTPException(409, "部署进行中，暂时不能修改配置")
-        conn.execute("UPDATE projects SET branch=?,build_command=?,start_command=?,healthcheck_url=?,updated_at=? WHERE id=?",
-                     (payload.branch,payload.build_command,payload.start_command,payload.healthcheck_url,db.now(),project_id))
+        conn.execute("UPDATE projects SET branch=?,build_command=?,start_command=?,healthcheck_url=?,runtime=?,runtime_config=?,updated_at=? WHERE id=?",
+                     (payload.branch,payload.build_command,payload.start_command,payload.healthcheck_url,runtime,json.dumps(settings),db.now(),project_id))
     return {"ok": True}
 
 

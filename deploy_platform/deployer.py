@@ -7,13 +7,14 @@ import time
 import uuid
 from pathlib import Path
 import httpx
-from . import db, cli_auth
+from . import db, cli_auth, existing, runtimes
 
 class DeploymentError(RuntimeError):
     pass
 
 _locks = {}
 _guard = threading.Lock()
+maintenance = threading.Event()
 
 def _run(args, *, cwd=None, env=None, timeout=900):
     r = subprocess.run(args, cwd=cwd, env=env, capture_output=True, text=True, timeout=timeout)
@@ -37,8 +38,9 @@ def _start(project, target):
     env = os.environ.copy()
     env['DEPLOY_RELEASE_DIR'] = str(target)
     env['DEPLOY_PROJECT_ROOT'] = project['deploy_root']
-    command = project['start_command']
-    _run(['cmd', '/c', command] if os.name == 'nt' else ['sh', '-c', command], cwd=target, env=env, timeout=120)
+    if not runtimes.restart(project, target):
+        command = project['start_command']
+        _run(['cmd', '/c', command] if os.name == 'nt' else ['sh', '-c', command], cwd=target, env=env, timeout=120)
     url = project.get('healthcheck_url')
     if url:
         for _ in range(15):
@@ -57,9 +59,11 @@ def _note(job, text):
 
 def deploy(project_id, *, account, project, action='deploy'):
     with _guard:
+        if maintenance.is_set():
+            raise DeploymentError('平台正在更新，请等待重启完成')
         lock = _locks.setdefault(project_id, threading.Lock())
-    if not lock.acquire(False):
-        raise DeploymentError('已有部署正在进行')
+        if not lock.acquire(False):
+            raise DeploymentError('已有部署正在进行')
     try:
         with db.connect() as c:
             job = c.execute("INSERT INTO deployments(project_id,action,status,started_at) VALUES (?,?,'queued',?)",(project_id,action,db.now())).lastrowid
@@ -70,13 +74,24 @@ def deploy(project_id, *, account, project, action='deploy'):
         raise
 
 def rollback(project_id, project):
+    column = 'previous_commit' if project.get('mode') == 'existing' else 'previous_release'
     with db.connect() as c:
-        previous = c.execute("SELECT previous_release FROM deployments WHERE project_id=? AND status='succeeded' ORDER BY id DESC LIMIT 1",(project_id,)).fetchone()
-    if not previous or not previous['previous_release']:
+        previous = c.execute(f"SELECT {column} FROM deployments WHERE project_id=? AND status='succeeded' ORDER BY id DESC LIMIT 1",(project_id,)).fetchone()
+    if not previous or not previous[column]:
         raise DeploymentError('没有可回滚的版本')
     return deploy(project_id,account={},project=project,action='rollback')
 
 def _worker(job, account, project, action, lock):
+    if project.get('mode') == 'existing':
+        try:
+            existing.execute(job,account,project,action,_note,_start,_run)
+        except Exception:
+            _note(job,'无法读取已有项目目录')
+            with db.connect() as c:
+                c.execute("UPDATE deployments SET status='failed',finished_at=? WHERE id=?",(db.now(),job))
+        finally:
+            lock.release()
+        return
     root = Path(project['deploy_root']).resolve()
     previous = ''
     activated = False

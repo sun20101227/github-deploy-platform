@@ -74,6 +74,15 @@ def init() -> None:
             conn.execute("ALTER TABLE projects ADD COLUMN webhook_secret TEXT NOT NULL DEFAULT ''")
         except sqlite3.OperationalError:
             pass
+        for table, name, definition in (
+            ('projects', 'mode', "TEXT NOT NULL DEFAULT 'release'"),
+            ('projects', 'runtime', "TEXT NOT NULL DEFAULT 'command'"),
+            ('projects', 'runtime_config', "TEXT NOT NULL DEFAULT '{}'"),
+            ('deployments', 'previous_commit', "TEXT NOT NULL DEFAULT ''"),
+        ):
+            columns = {row[1] for row in conn.execute(f'PRAGMA table_info({table})')}
+            if name not in columns:
+                conn.execute(f'ALTER TABLE {table} ADD COLUMN {name} {definition}')
 
 
 def row_to_dict(row):
