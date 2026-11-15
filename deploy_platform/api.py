@@ -3,19 +3,39 @@ from __future__ import annotations
 import hashlib
 import hmac
 import secrets
+import httpx
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+from pathlib import Path
+import sqlite3
 
-from . import db, github
+from . import db, github, cli_auth, config
 from .deployer import DeploymentError, deploy, rollback
 from . import self_update
 
 app = FastAPI(title="GitHub Deploy Platform", version="0.1.0")
 db.init()
 oauth_states: set[str] = set()
+
+
+@app.middleware("http")
+async def admin_access(request, call_next):
+    import os
+    from fastapi.responses import JSONResponse
+    if request.url.path.startswith('/api/'):
+        key = os.environ.get('DEPLOY_ADMIN_TOKEN', '')
+        provided = request.headers.get('Authorization', '').removeprefix('Bearer ')
+        if key:
+            allowed = hmac.compare_digest(key, provided)
+        else:
+            allowed = request.client and request.client.host in ('127.0.0.1', '::1', 'testclient') and not request.headers.get('x-forwarded-for')
+        if not allowed:
+            return JSONResponse({'detail': '请输入管理密钥；服务器需设置 DEPLOY_ADMIN_TOKEN'}, status_code=401)
+    return await call_next(request)
+
 
 
 class ProjectCreate(BaseModel):
@@ -27,6 +47,31 @@ class ProjectCreate(BaseModel):
     start_command: str
     healthcheck_url: str = ""
     webhook_secret: str = ""
+
+    @field_validator('branch')
+    @classmethod
+    def valid_branch(cls, value):
+        if not value or value.startswith('-') or any(c.isspace() for c in value) or '..' in value or any(c in value for c in '~^:?*[\\'):
+            raise ValueError('分支名称无效')
+        return value
+
+    @field_validator('deploy_root')
+    @classmethod
+    def valid_root(cls, value):
+        target = Path(value).resolve()
+        if not Path(value).is_absolute():
+            raise ValueError('请输入服务器上的绝对路径')
+        if target == Path(target.anchor) or target == config.ROOT or target in config.ROOT.parents:
+            raise ValueError('请选择独立的项目目录')
+        return str(target)
+
+    @field_validator('start_command')
+    @classmethod
+    def nonempty_start(cls, value):
+        if not value.strip():
+            raise ValueError('请填写启动命令')
+        return value
+
 
 
 
@@ -60,7 +105,7 @@ async def github_callback(code: str = Query(...), state: str = Query(...)):
             (account["github_id"], account["login"], account["access_token"], timestamp, timestamp),
         )
         row = conn.execute("SELECT id, login FROM github_accounts WHERE github_id=?", (account["github_id"],)).fetchone()
-    return {"account_id": row["id"], "login": row["login"]}
+    return RedirectResponse("/#/github", status_code=303)
 
 
 @app.get("/api/accounts")
@@ -75,7 +120,7 @@ async def account_repositories(account_id: int):
         row = conn.execute("SELECT access_token FROM github_accounts WHERE id=?", (account_id,)).fetchone()
     if not row:
         raise HTTPException(404, "GitHub 账号不存在")
-    return await github.repositories(row["access_token"])
+    return await github.repositories(cli_auth.token(row["access_token"]))
 
 
 @app.get("/api/projects")
@@ -101,6 +146,9 @@ def self_update_check():
 
 @app.post("/api/self-update/apply")
 def self_update_apply():
+    with db.connect() as conn:
+        if conn.execute("SELECT 1 FROM deployments WHERE status IN ('queued','running')").fetchone():
+            raise HTTPException(409, "请等部署任务结束后再更新平台")
     try:
         return self_update.apply()
     except RuntimeError as exc:
@@ -112,6 +160,8 @@ def create_project(payload: ProjectCreate):
     with db.connect() as conn:
         if not conn.execute("SELECT 1 FROM github_accounts WHERE id=?", (payload.account_id,)).fetchone():
             raise HTTPException(404, "GitHub 账号不存在")
+        if conn.execute("SELECT 1 FROM projects WHERE deploy_root=?", (payload.deploy_root,)).fetchone():
+            raise HTTPException(409, "这个部署目录已被其他项目使用")
         timestamp = db.now()
         webhook_secret = payload.webhook_secret or secrets.token_hex(32)
         cursor = conn.execute(
@@ -131,7 +181,7 @@ def deploy_project(project_id: int):
         if not row:
             raise HTTPException(404, "项目不存在")
         account = conn.execute("SELECT * FROM github_accounts WHERE id=?", (row["account_id"],)).fetchone()
-    deployment_id = deploy(project_id, dict(account), dict(row))
+    deployment_id = deploy(project_id, account=dict(account), project=dict(row))
     return {"deployment_id": deployment_id, "status": "queued"}
 
 
@@ -150,7 +200,7 @@ async def check_project(project_id: int):
         ).fetchone()
     if not row:
         raise HTTPException(404, "项目不存在")
-    latest = await github.latest_commit(row["access_token"], row["repository"], row["branch"])
+    latest = await github.latest_commit(cli_auth.token(row["access_token"]), row["repository"], row["branch"])
     with db.connect() as conn:
         current = conn.execute(
             "SELECT commit_sha FROM deployments WHERE project_id=? AND status='succeeded' ORDER BY id DESC LIMIT 1",
@@ -166,7 +216,7 @@ def rollback_project(project_id: int):
     if not row:
         raise HTTPException(404, "项目不存在")
     try:
-        return {"deployment_id": rollback(project_id, dict(row)), "status": "succeeded"}
+        return {"deployment_id": rollback(project_id, dict(row)), "status": "queued"}
     except DeploymentError as exc:
         raise HTTPException(409, str(exc)) from exc
 
@@ -193,11 +243,64 @@ async def github_webhook(project_id: int, request: Request):
     if not hmac.compare_digest(signature, expected):
         raise HTTPException(401, "Webhook 签名无效")
     payload = await request.json()
+    if request.headers.get('x-github-event') != 'push' or payload.get('deleted') or payload.get('repository', {}).get('full_name') != row['repository']:
+        return {"ok": True, "ignored": True}
     ref = payload.get("ref", "")
     if ref != "refs/heads/" + row["branch"]:
         return {"ok": True, "ignored": True, "reason": "branch"}
-    deployment_id = deploy(project_id, dict(row), dict(row), action="webhook")
+    deployment_id = deploy(project_id, account=dict(row), project=dict(row), action="webhook")
     return {"ok": True, "deployment_id": deployment_id}
+
+
+@app.exception_handler(RuntimeError)
+async def runtime_error(request, exc):
+    from fastapi.responses import JSONResponse
+    return JSONResponse({"detail": str(exc)}, status_code=409)
+
+
+@app.exception_handler(httpx.HTTPError)
+async def upstream_error(request, exc):
+    from fastapi.responses import JSONResponse
+    return JSONResponse({"detail": "GitHub 请求失败，请检查网络和账号权限"}, status_code=502)
+
+
+@app.get("/api/github/status")
+def github_status():
+    try:
+        return {"connected": True, **cli_auth.identity()}
+    except RuntimeError as exc:
+        return {"connected": False, "message": str(exc)}
+
+
+@app.post("/api/github/connect")
+def github_connect():
+    user = cli_auth.identity()
+    with db.connect() as conn:
+        conn.execute(
+            "INSERT INTO github_accounts(github_id,login,access_token,created_at,updated_at) VALUES (?,?,?,?,?) "
+            "ON CONFLICT(github_id) DO UPDATE SET login=excluded.login,access_token=excluded.access_token,updated_at=excluded.updated_at",
+            (user['github_id'], user['login'], 'gh-cli:'+user['github_id'], db.now(), db.now()))
+    return user
+
+
+@app.get("/api/projects/{project_id}")
+def project_detail(project_id: int):
+    with db.connect() as conn:
+        row = conn.execute("SELECT p.*, a.login AS github_login FROM projects p JOIN github_accounts a ON a.id=p.account_id WHERE p.id=?", (project_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "项目不存在")
+    return dict(row)
+
+
+@app.put("/api/projects/{project_id}")
+def edit_project(project_id: int, payload: ProjectCreate):
+    project_detail(project_id)
+    with db.connect() as conn:
+        if conn.execute("SELECT 1 FROM deployments WHERE project_id=? AND status IN ('queued','running')", (project_id,)).fetchone():
+            raise HTTPException(409, "部署进行中，暂时不能修改配置")
+        conn.execute("UPDATE projects SET branch=?,build_command=?,start_command=?,healthcheck_url=?,updated_at=? WHERE id=?",
+                     (payload.branch,payload.build_command,payload.start_command,payload.healthcheck_url,db.now(),project_id))
+    return {"ok": True}
 
 
 app.mount("/", StaticFiles(directory=__import__("pathlib").Path(__file__).with_name("web"), html=True), name="web")

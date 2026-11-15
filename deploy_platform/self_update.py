@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import base64
 import shutil
 import subprocess
 import threading
@@ -34,12 +35,14 @@ def _auth_env() -> dict:
     env["GIT_TERMINAL_PROMPT"] = "0"
     env["GIT_CONFIG_COUNT"] = "1"
     env["GIT_CONFIG_KEY_0"] = "http.https://github.com/.extraheader"
-    env["GIT_CONFIG_VALUE_0"] = f"AUTHORIZATION: bearer {token}"
+    env["GIT_CONFIG_VALUE_0"] = "Authorization: Basic " + base64.b64encode(("x-access-token:" + token).encode()).decode()
     return env
 
 
 def _info() -> dict:
     branch = _run(["git", "branch", "--show-current"])
+    if not branch:
+        raise RuntimeError("当前未检出分支，请先切换到部署分支")
     remote = _run(["git", "remote", "get-url", "origin"])
     commit = _run(["git", "rev-parse", "HEAD"])
     return {"branch": branch or "main", "remote": remote, "commit": commit}
@@ -75,8 +78,11 @@ def apply() -> dict:
         _run(["git", "merge-base", "--is-ancestor", info["commit"], f"origin/{info['branch']}"], timeout=30)
         _run(["git", "pull", "--ff-only", "origin", info["branch"]], env=env, timeout=300)
         new_commit = _run(["git", "rev-parse", "HEAD"])
-        _state.update(phase="restarting", message="本体更新完成，等待进程管理器重启", commit=new_commit)
+        _state.update(phase="restart_required", message="代码已更新，请重启平台服务", commit=new_commit)
         return {"ok": True, "restart_required": True, "commit": new_commit}
+    except Exception:
+        _state.update(phase="failed", message="更新失败，查看错误后重试")
+        raise
     finally:
         _lock.release()
 

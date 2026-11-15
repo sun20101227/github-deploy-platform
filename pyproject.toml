@@ -17,3 +17,6 @@ dependencies = [
 [tool.setuptools.packages.find]
 include = ["deploy_platform*"]
 
+[tool.setuptools.package-data]
+deploy_platform = ["web/*"]
+
