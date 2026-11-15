@@ -63,12 +63,47 @@ def test_existing_update_restarts_and_failure_restores(setup):
         job=c.execute("INSERT INTO deployments(project_id,action,status,started_at) VALUES (?,'deploy','queued',?)",(p['id'],db.now())).lastrowid
     start=Mock(side_effect=[RuntimeError('bad health'),None])
     with patch.object(existing.subprocess,'run',side_effect=fake_fetch),patch.object(existing.cli_auth,'token',return_value='fake'):
-        existing.execute(job,{'access_token':'fake'},p,'deploy',deployer._note,start,Mock())
+        existing.execute(job,{'access_token':'fake'},p,'deploy',deployer._note,start,Mock(return_value=''))
     assert repo.head.commit.hexsha==before
     assert start.call_count==2
     assert (root/'.env').read_text()=='PRIVATE=preserve-me'
     with db.connect() as c:
         assert c.execute('SELECT status FROM deployments WHERE id=?',(job,)).fetchone()[0]=='rolled_back'
+
+
+def test_existing_build_failure_and_output_are_recorded(setup):
+    root,repo,client=setup
+    before=repo.head.commit.hexsha
+    p={**import_project(root,client),'build_command':'make'}
+    (root/'app.txt').write_text('new');repo.index.add(['app.txt']);after=repo.index.commit('new').hexsha
+    repo.git.update_index('--refresh')
+    repo.git.reset('--keep',before)
+    def fake_fetch(*args,**kwargs):
+        (Path(repo.git_dir)/'FETCH_HEAD').write_text(after+'\t\tbranch main\n')
+    def attempt(run,start):
+        with db.connect() as c:
+            job=c.execute("INSERT INTO deployments(project_id,action,status,started_at) VALUES (?,'deploy','queued',?)",(p['id'],db.now())).lastrowid
+        with patch.object(existing.subprocess,'run',side_effect=fake_fetch),patch.object(existing.cli_auth,'token',return_value='fake'):
+            existing.execute(job,{'access_token':'fake'},p,'deploy',deployer._note,start,run)
+        with db.connect() as c:
+            return c.execute('SELECT status,message FROM deployments WHERE id=?',(job,)).fetchone()
+    # The build fails on the new commit, then succeeds again on the restored one.
+    row=attempt(Mock(side_effect=[deployer.DeploymentError('npm ERR! missing script: build'),'']),Mock())
+    assert row['status']=='rolled_back'
+    assert 'npm ERR! missing script: build' in row['message']
+    assert repo.head.commit.hexsha==before
+    row=attempt(Mock(return_value='built 42 modules'),Mock(side_effect=[deployer.DeploymentError('服务健康检查未通过'),None]))
+    assert row['status']=='rolled_back'
+    assert 'built 42 modules' in row['message'] and '服务健康检查未通过' in row['message']
+    # Git failures may echo credentials, so they keep the generic message.
+    with db.connect() as c:
+        job=c.execute("INSERT INTO deployments(project_id,action,status,started_at) VALUES (?,'deploy','queued',?)",(p['id'],db.now())).lastrowid
+    boom=existing.subprocess.CalledProcessError(128,'git',stderr='Authorization: Basic c2VjcmV0')
+    with patch.object(existing.subprocess,'run',side_effect=boom),patch.object(existing.cli_auth,'token',return_value='fake'):
+        existing.execute(job,{'access_token':'fake'},p,'deploy',deployer._note,Mock(),Mock(return_value=''))
+    with db.connect() as c:
+        message=c.execute('SELECT message FROM deployments WHERE id=?',(job,)).fetchone()['message']
+    assert 'c2VjcmV0' not in message and '更新或重启失败' in message
 
 
 def test_dirty_repo_does_not_restart(setup):
@@ -77,7 +112,7 @@ def test_dirty_repo_does_not_restart(setup):
     with db.connect() as c:
         job=c.execute("INSERT INTO deployments(project_id,action,status,started_at) VALUES (?,'deploy','queued',?)",(p['id'],db.now())).lastrowid
     start=Mock()
-    existing.execute(job,{},p,'deploy',deployer._note,start,Mock())
+    existing.execute(job,{},p,'deploy',deployer._note,start,Mock(return_value=''))
     start.assert_not_called()
     assert (root/'app.txt').read_text()=='local changes'
 
@@ -137,11 +172,11 @@ def test_existing_success_and_manual_rollback(setup):
     start=Mock()
     with patch.object(existing.subprocess,'run',side_effect=fake_fetch),patch.object(existing.cli_auth,'token',return_value='fake'):
         update=job('update')
-        existing.execute(update,{'access_token':'fake'},p,'update',deployer._note,start,Mock())
+        existing.execute(update,{'access_token':'fake'},p,'update',deployer._note,start,Mock(return_value=''))
     assert repo.head.commit.hexsha==after
     start.assert_called_once()
     rollback=job('rollback')
-    existing.execute(rollback,{},p,'rollback',deployer._note,start,Mock())
+    existing.execute(rollback,{},p,'rollback',deployer._note,start,Mock(return_value=''))
     assert repo.head.commit.hexsha==before
     assert start.call_count==2
     assert (root/'.env').read_text()=='PRIVATE=preserve-me'
@@ -216,7 +251,7 @@ def test_remote_cannot_overwrite_ignored_configuration(setup):
         job=c.execute("INSERT INTO deployments(project_id,action,status,started_at) VALUES (?,'update','queued',?)",(p['id'],db.now())).lastrowid
     start=Mock()
     with patch.object(existing.subprocess,'run',side_effect=fake_fetch),patch.object(existing.cli_auth,'token',return_value='fake'):
-        existing.execute(job,{'access_token':'fake'},p,'update',deployer._note,start,Mock())
+        existing.execute(job,{'access_token':'fake'},p,'update',deployer._note,start,Mock(return_value=''))
     assert (root/'.env').read_text()=='PRIVATE=preserve-me'
     assert repo.head.commit.hexsha==before
     start.assert_not_called()

@@ -69,6 +69,7 @@ function importForm(p,accounts,back) {
       <label>重启命令<input name="start_command" placeholder="例如 pm2 restart my-app --update-env"></label>
       <label>构建命令<input name="build_command" placeholder="可留空；Compose 会自动构建"></label>
       <label>健康检查<input name="healthcheck_url" type="url" placeholder="http://127.0.0.1:3000/health"></label>
+      <label>健康检查最长等待（秒）<input name="healthcheck_timeout" type="number" required min="5" max="600" value="45"></label>
       <p class="settings-note">接入只登记配置。点击项目里的更新按钮后，才会更新代码并重启服务。</p>
       <div class="buttons"><button class="primary">确认接入</button><button type="button" id="cancel-import">取消</button></div></form>`:'<a class="button" href="#/github">先连接 GitHub</a>'}</section>`;
   $('#back-results').onclick=back;
@@ -80,7 +81,7 @@ function importForm(p,accounts,back) {
     e.preventDefault();
     busy(e.submitter,async()=>{
       const f=Object.fromEntries(new FormData(form));
-      const result=await api('/api/projects/import',{path:p.path,account_id:Number(f.account_id),runtime:f.runtime,runtime_config:readRuntime(form),start_command:f.start_command,build_command:f.build_command,healthcheck_url:f.healthcheck_url});
+      const result=await api('/api/projects/import',{path:p.path,account_id:Number(f.account_id),runtime:f.runtime,runtime_config:readRuntime(form),start_command:f.start_command,build_command:f.build_command,healthcheck_url:f.healthcheck_url,healthcheck_timeout:Number(f.healthcheck_timeout)});
       toast('已接入，现有服务未改动');location.hash=`/project/${result.id}`;
     });
   };

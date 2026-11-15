@@ -39,6 +39,9 @@ def test_management_auth_and_assets(client):
     assert client.get('/').status_code==200
     assert client.get('/app.js').status_code==200
     assert client.post('/webhooks/github/1',json={}).status_code==404
+    # The unauthenticated OAuth routes are gone; accounts connect only through gh behind the admin key.
+    assert client.get('/auth/github/start',headers={'Authorization':''},follow_redirects=False).status_code==404
+    assert client.get('/auth/github/callback?code=x&state=y',headers={'Authorization':''}).status_code==404
 
 
 def test_cli_connect_never_stores_token(client):
@@ -77,6 +80,76 @@ def test_duplicate_deploy_rejected(client,tmp_path):
             deployer._locks[p['id']].release()
 
 
+def test_interrupted_jobs_are_closed_on_startup(client,tmp_path):
+    p=project(client,tmp_path)
+    with db.connect() as c:
+        for status in ('queued','running','succeeded'):
+            c.execute("INSERT INTO deployments(project_id,action,status,started_at) VALUES(1,'deploy',?,?)",(status,db.now()))
+    assert client.put('/api/projects/1',json=p).status_code==409
+    assert db.recover_interrupted()==2
+    with db.connect() as c:
+        rows=c.execute('SELECT status,message,finished_at FROM deployments ORDER BY id').fetchall()
+    assert [r['status'] for r in rows]==['failed','failed','succeeded']
+    assert '重启' in rows[0]['message'] and rows[0]['finished_at']
+    assert rows[2]['message']==''
+    assert client.put('/api/projects/1',json=p).status_code==200
+
+
+def test_push_during_deploy_runs_once_more_afterwards(client,tmp_path):
+    import hashlib, hmac, json
+    p=project(client,tmp_path)
+    body=json.dumps({'ref':'refs/heads/main','repository':{'full_name':'test/repo'}}).encode()
+    headers={'x-github-event':'push','content-type':'application/json',
+             'x-hub-signature-256':'sha256='+hmac.new(p['webhook_secret'].encode(),body,hashlib.sha256).hexdigest()}
+    def jobs():
+        with db.connect() as c:
+            return [r['action'] for r in c.execute('SELECT action FROM deployments ORDER BY id')]
+    with patch.object(deployer.threading.Thread,'start'):
+        try:
+            deployer.deploy(p['id'],account={},project=p)
+            lock=deployer._locks[p['id']]
+            for _ in range(2):
+                assert client.post('/webhooks/github/1',content=body,headers=headers).json()=={'ok':True,'queued':True}
+            assert jobs()==['deploy']
+            deployer._finish(p['id'],lock)
+            assert jobs()==['deploy','webhook']
+            assert lock.locked()
+            deployer._finish(p['id'],lock)
+            assert jobs()==['deploy','webhook']
+            assert not lock.locked()
+        finally:
+            deployer._pending.discard(p['id'])
+            if deployer._locks[p['id']].locked():
+                deployer._locks[p['id']].release()
+
+
+def test_old_releases_are_pruned_but_rollback_target_stays(client,tmp_path):
+    import os, stat
+    p=project(client,tmp_path)
+    root=Path(p['deploy_root']);releases=root/'releases'
+    for name in ['1','2','3','4','5','6','7','8','manual']:
+        (releases/name).mkdir(parents=True)
+    locked=releases/'2'/'object';locked.write_text('x');os.chmod(locked,stat.S_IREAD)
+    assert deployer._prune(root,[releases/'8',str(releases/'1'),''])==2
+    assert sorted(d.name for d in releases.iterdir())==['1','4','5','6','7','8','manual']
+
+
+def test_successful_deploy_prunes_and_stays_successful(client,tmp_path):
+    p=project(client,tmp_path)
+    root=Path(p['deploy_root'])
+    with db.connect() as c:
+        job=c.execute("INSERT INTO deployments(project_id,action,status,started_at) VALUES(1,'deploy','queued',?)",(db.now(),)).lastrowid
+    lock=threading.Lock();lock.acquire()
+    with patch.object(deployer,'_run',return_value='c'*40),patch.object(deployer,'_start'),patch.object(deployer,'_prune',side_effect=OSError('busy')) as prune:
+        deployer._worker(job,{'access_token':'fake'},p,'deploy',lock)
+    assert [Path(x) for x in prune.call_args.args[1][:1]]==[root/'releases'/str(job)]
+    with db.connect() as c:
+        row=c.execute('SELECT status,message FROM deployments WHERE id=?',(job,)).fetchone()
+    assert row['status']=='succeeded'
+    assert '清理未完成' in row['message']
+    assert not lock.locked()
+
+
 def test_invalid_root_and_duplicate_directory(client,tmp_path):
     p=project(client,tmp_path)
     assert client.post('/api/projects',json=p).status_code==409
@@ -104,6 +177,46 @@ def test_manual_rollback_starts_target_and_records_commit(client,tmp_path):
 
 
 def test_healthcheck_failure_is_not_success():
-    with patch.object(deployer,'_run'),patch.object(deployer.httpx,'get',return_value=type('Response',(),{'status_code':503})()),patch.object(deployer.time,'sleep'):
-        with pytest.raises(deployer.DeploymentError,match='健康检查'):
-            deployer._start({'deploy_root':'.','start_command':'echo ok','healthcheck_url':'http://localhost/health'},Path('.'))
+    import itertools
+    project={'deploy_root':'.','start_command':'echo ok','healthcheck_url':'http://localhost/health'}
+    response=lambda code: type('Response',(),{'status_code':code})()
+    def start(project,answers,clock):
+        with patch.object(deployer,'_run'),patch.object(deployer.httpx,'get',side_effect=answers) as get,\
+             patch.object(deployer.time,'sleep'),patch.object(deployer.time,'monotonic',side_effect=clock):
+            deployer._start(project,Path('.'))
+        return get.call_count
+    # One clock reading per attempt, 10 seconds apart: the default 45 seconds allows 5 more tries.
+    with pytest.raises(deployer.DeploymentError,match='健康检查未通过（已等待 45 秒）'):
+        start(project,itertools.repeat(response(503)),itertools.count(0,10))
+    # A slow service passes once the project allows a longer wait.
+    slow=[response(503)]*8+[response(200)]
+    with pytest.raises(deployer.DeploymentError):
+        start(project,list(slow),itertools.count(0,10))
+    assert start({**project,'healthcheck_timeout':120},list(slow),itertools.count(0,10))==9
+
+
+def test_healthcheck_timeout_is_saved_and_validated(client,tmp_path):
+    p=project(client,tmp_path)
+    assert p['healthcheck_timeout']==45
+    assert client.put('/api/projects/1',json={**p,'healthcheck_timeout':'180'}).status_code==200
+    assert client.get('/api/projects/1').json()['healthcheck_timeout']==180
+    for bad in (0,601,'soon'):
+        assert client.put('/api/projects/1',json={**p,'healthcheck_timeout':bad}).status_code==422
+
+
+def test_repository_list_follows_pages_only_inside_github():
+    import asyncio, httpx
+    from deploy_platform import github
+    seen=[]
+    def handler(request):
+        seen.append(str(request.url))
+        page=int(request.url.params.get('page','1'))
+        repos=[{'full_name':f'me/repo{page}','private':False,'default_branch':None}]
+        nxt={1:'https://api.github.com/user/repos?per_page=100&page=2',2:'https://evil.example/user/repos?page=3'}.get(page)
+        return httpx.Response(200,json=repos,headers={'Link':f'<{nxt}>; rel="next"'} if nxt else {})
+    real=httpx.AsyncClient
+    with patch.object(github.httpx,'AsyncClient',lambda **kw: real(transport=httpx.MockTransport(handler),**kw)):
+        result=asyncio.run(github.repositories('token'))
+    assert [r['full_name'] for r in result]==['me/repo1','me/repo2']
+    assert result[0]['default_branch']=='main'
+    assert len(seen)==2 and all(u.startswith('https://api.github.com/') for u in seen)

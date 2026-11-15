@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -62,11 +61,6 @@ def init() -> None:
                 started_at TEXT NOT NULL,
                 finished_at TEXT NOT NULL DEFAULT ''
             );
-            CREATE TABLE IF NOT EXISTS sessions (
-                id TEXT PRIMARY KEY,
-                account_id INTEGER NOT NULL REFERENCES github_accounts(id),
-                expires_at INTEGER NOT NULL
-            );
             """
         )
         # Keep development databases created by the first scaffold usable.
@@ -79,16 +73,19 @@ def init() -> None:
             ('projects', 'runtime', "TEXT NOT NULL DEFAULT 'command'"),
             ('projects', 'runtime_config', "TEXT NOT NULL DEFAULT '{}'"),
             ('deployments', 'previous_commit', "TEXT NOT NULL DEFAULT ''"),
+            ('projects', 'healthcheck_timeout', "INTEGER NOT NULL DEFAULT 45"),
         ):
             columns = {row[1] for row in conn.execute(f'PRAGMA table_info({table})')}
             if name not in columns:
                 conn.execute(f'ALTER TABLE {table} ADD COLUMN {name} {definition}')
 
 
-def row_to_dict(row):
-    return dict(row) if row else None
-
-
-def json_text(value) -> str:
-    return json.dumps(value, ensure_ascii=False)
+def recover_interrupted() -> int:
+    """Jobs run in threads of this process, so none can outlive a restart."""
+    with connect() as conn:
+        return conn.execute(
+            "UPDATE deployments SET status='failed', finished_at=?, message=message || ? "
+            "WHERE status IN ('queued','running')",
+            (now(), '平台重启导致任务中断；服务可能停在中间状态，请检查后重新部署\n'),
+        ).rowcount
 

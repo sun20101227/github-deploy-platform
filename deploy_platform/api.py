@@ -5,12 +5,10 @@ import hmac
 import secrets
 import httpx
 
-from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import RedirectResponse
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 from pathlib import Path
-import sqlite3
 import json
 import uuid
 from typing import Literal
@@ -22,7 +20,7 @@ from . import deployer
 
 app = FastAPI(title="GitHub Deploy Platform", version="0.1.0")
 db.init()
-oauth_states: set[str] = set()
+db.recover_interrupted()
 INSTANCE = uuid.uuid4().hex
 
 
@@ -51,6 +49,7 @@ class ProjectCreate(BaseModel):
     build_command: str = ""
     start_command: str
     healthcheck_url: str = ""
+    healthcheck_timeout: int = Field(default=45, ge=5, le=600)
     webhook_secret: str = ""
     runtime: Literal['command','compose','systemd'] = 'command'
     runtime_config: dict = Field(default_factory=dict)
@@ -80,33 +79,6 @@ class ProjectCreate(BaseModel):
 @app.get("/health")
 def health():
     return {"ok": True, "instance": INSTANCE}
-
-
-@app.get("/auth/github/start")
-def github_start():
-    try:
-        url, state = github.authorization_url()
-    except RuntimeError as exc:
-        raise HTTPException(503, str(exc)) from exc
-    oauth_states.add(state)
-    return RedirectResponse(url)
-
-
-@app.get("/auth/github/callback")
-async def github_callback(code: str = Query(...), state: str = Query(...)):
-    if state not in oauth_states:
-        raise HTTPException(400, "OAuth state 无效或已使用")
-    oauth_states.remove(state)
-    account = await github.exchange_code(code)
-    with db.connect() as conn:
-        timestamp = db.now()
-        conn.execute(
-            "INSERT INTO github_accounts(github_id, login, access_token, created_at, updated_at) VALUES (?, ?, ?, ?, ?) "
-            "ON CONFLICT(github_id) DO UPDATE SET login=excluded.login, access_token=excluded.access_token, updated_at=excluded.updated_at",
-            (account["github_id"], account["login"], account["access_token"], timestamp, timestamp),
-        )
-        row = conn.execute("SELECT id, login FROM github_accounts WHERE github_id=?", (account["github_id"],)).fetchone()
-    return RedirectResponse("/#/github", status_code=303)
 
 
 @app.get("/api/accounts")
@@ -176,6 +148,7 @@ class ImportRequest(BaseModel):
     start_command: str = ''
     build_command: str = ''
     healthcheck_url: str = ''
+    healthcheck_timeout: int = Field(default=45, ge=5, le=600)
 
 
 @app.post('/api/discovery/scan')
@@ -205,8 +178,8 @@ def import_project(payload: ImportRequest):
         if any(root==p or root.is_relative_to(p) or p.is_relative_to(root) for p in paths):
             raise HTTPException(409,'目录与已有项目重叠')
         now=db.now()
-        job=c.execute("INSERT INTO projects(account_id,repository,branch,deploy_root,build_command,start_command,healthcheck_url,webhook_secret,created_at,updated_at,mode,runtime,runtime_config) VALUES (?,?,?,?,?,?,?,?,?,?,'existing',?,?)",
-            (payload.account_id,item['repository'],item['branch'],item['path'],payload.build_command,payload.start_command,payload.healthcheck_url,secrets.token_hex(32),now,now,payload.runtime,json.dumps(settings))).lastrowid
+        job=c.execute("INSERT INTO projects(account_id,repository,branch,deploy_root,build_command,start_command,healthcheck_url,webhook_secret,created_at,updated_at,mode,runtime,runtime_config,healthcheck_timeout) VALUES (?,?,?,?,?,?,?,?,?,?,'existing',?,?,?)",
+            (payload.account_id,item['repository'],item['branch'],item['path'],payload.build_command,payload.start_command,payload.healthcheck_url,secrets.token_hex(32),now,now,payload.runtime,json.dumps(settings),payload.healthcheck_timeout)).lastrowid
         c.execute("INSERT INTO deployments(project_id,action,status,commit_sha,release_dir,message,started_at,finished_at) VALUES (?,'import','succeeded',?,?,'已登记当前提交；未修改代码或重启服务',?,?)",(job,item['commit'],item['path'],now,now))
     return {'id':job}
 
@@ -229,11 +202,11 @@ def create_project(payload: ProjectCreate):
         timestamp = db.now()
         webhook_secret = payload.webhook_secret or secrets.token_hex(32)
         cursor = conn.execute(
-            "INSERT INTO projects(account_id, repository, branch, deploy_root, build_command, start_command, healthcheck_url, webhook_secret, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO projects(account_id, repository, branch, deploy_root, build_command, start_command, healthcheck_url, webhook_secret, created_at, updated_at, healthcheck_timeout) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (payload.account_id, payload.repository, payload.branch, payload.deploy_root,
              payload.build_command, payload.start_command, payload.healthcheck_url,
              webhook_secret,
-             timestamp, timestamp),
+             timestamp, timestamp, payload.healthcheck_timeout),
         )
         return {"id": cursor.lastrowid, "webhook_secret": webhook_secret}
 
@@ -312,7 +285,10 @@ async def github_webhook(project_id: int, request: Request):
     ref = payload.get("ref", "")
     if ref != "refs/heads/" + row["branch"]:
         return {"ok": True, "ignored": True, "reason": "branch"}
-    deployment_id = deploy(project_id, account=dict(row), project=dict(row), action="webhook")
+    deployment_id = deploy(project_id, account=dict(row), project=dict(row), action="webhook", queue=True)
+    if deployment_id is None:
+        # A job is running; it starts one more update when it ends, so this push is not lost.
+        return {"ok": True, "queued": True}
     return {"ok": True, "deployment_id": deployment_id}
 
 
@@ -366,8 +342,8 @@ def edit_project(project_id: int, payload: ProjectCreate):
     with db.connect() as conn:
         if conn.execute("SELECT 1 FROM deployments WHERE project_id=? AND status IN ('queued','running')", (project_id,)).fetchone():
             raise HTTPException(409, "部署进行中，暂时不能修改配置")
-        conn.execute("UPDATE projects SET branch=?,build_command=?,start_command=?,healthcheck_url=?,runtime=?,runtime_config=?,updated_at=? WHERE id=?",
-                     (payload.branch,payload.build_command,payload.start_command,payload.healthcheck_url,runtime,json.dumps(settings),db.now(),project_id))
+        conn.execute("UPDATE projects SET branch=?,build_command=?,start_command=?,healthcheck_url=?,healthcheck_timeout=?,runtime=?,runtime_config=?,updated_at=? WHERE id=?",
+                     (payload.branch,payload.build_command,payload.start_command,payload.healthcheck_url,payload.healthcheck_timeout,runtime,json.dumps(settings),db.now(),project_id))
     return {"ok": True}
 
 

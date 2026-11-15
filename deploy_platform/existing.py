@@ -50,15 +50,19 @@ def execute(job, account, project, action, note, start, run):
             if project['build_command']:
                 cmd=project['build_command']
                 note(job,'执行构建')
-                run(['cmd','/c',cmd] if os.name=='nt' else ['sh','-c',cmd],cwd=root,timeout=1800)
+                output=run(['cmd','/c',cmd] if os.name=='nt' else ['sh','-c',cmd],cwd=root,timeout=1800)
+                if output:
+                    note(job,output[-4000:])
             note(job,'重启服务并检查状态')
             start(project,root)
             with db.connect() as c:
                 c.execute("UPDATE deployments SET status='succeeded',finished_at=? WHERE id=?",(db.now(),job))
             note(job,'更新与重启完成')
         except Exception as exc:
-            # Git errors can echo URLs/headers. Return only intentional application errors.
-            note(job,str(exc) if type(exc) is RuntimeError else '更新或重启失败，请检查本机 Git 和服务日志')
+            # Git errors can echo URLs/headers. Return only intentional application errors:
+            # RuntimeError and its subclass DeploymentError (build output, failed health check).
+            # Git and subprocess failures are other types and stay hidden.
+            note(job,str(exc) if isinstance(exc,RuntimeError) else '更新或重启失败，请检查本机 Git 和服务日志')
             status='failed'
             if changed:
                 try:

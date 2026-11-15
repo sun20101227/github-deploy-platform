@@ -1,20 +1,46 @@
 """Prepare releases separately; serialize activation and restore the last service on failure."""
 import base64
 import os
+import shutil
+import stat
 import subprocess
+import sys
 import threading
 import time
 import uuid
 from pathlib import Path
 import httpx
-from . import db, cli_auth, existing, runtimes
+from . import config, db, cli_auth, existing, runtimes
 
 class DeploymentError(RuntimeError):
     pass
 
 _locks = {}
+_pending = set()  # projects that received a push while a job was running
 _guard = threading.Lock()
 maintenance = threading.Event()
+
+
+def _writable(func, path, _):
+    # Git marks object files read-only; Windows refuses to delete those.
+    os.chmod(path, stat.S_IWRITE)
+    func(path)
+
+_RMTREE = {'onexc': _writable} if sys.version_info >= (3, 12) else {'onerror': _writable}
+
+
+def _prune(root, keep):
+    """Delete old numbered release directories, never the ones listed in keep."""
+    releases = (root / 'releases').resolve()
+    protected = {Path(p).resolve() for p in keep if p}
+    numbered = sorted((p for p in releases.iterdir() if p.name.isdigit() and p.is_dir() and not p.is_symlink()),
+                      key=lambda p: int(p.name), reverse=True)
+    removed = 0
+    for path in numbered[config.KEEP_RELEASES:]:
+        if path.resolve() not in protected:
+            shutil.rmtree(path, **_RMTREE)
+            removed += 1
+    return removed
 
 def _run(args, *, cwd=None, env=None, timeout=900):
     r = subprocess.run(args, cwd=cwd, env=env, capture_output=True, text=True, timeout=timeout)
@@ -43,26 +69,33 @@ def _start(project, target):
         _run(['cmd', '/c', command] if os.name == 'nt' else ['sh', '-c', command], cwd=target, env=env, timeout=120)
     url = project.get('healthcheck_url')
     if url:
-        for _ in range(15):
+        wait = int(project.get('healthcheck_timeout') or 45)
+        deadline = time.monotonic() + wait
+        while True:
             try:
                 r = httpx.get(url, timeout=2, follow_redirects=False)
                 if 200 <= r.status_code < 300:
                     return
             except httpx.HTTPError:
                 pass
+            if time.monotonic() >= deadline:
+                raise DeploymentError(f'服务健康检查未通过（已等待 {wait} 秒）')
             time.sleep(1)
-        raise DeploymentError('服务健康检查未通过')
 
 def _note(job, text):
     with db.connect() as c:
         c.execute("UPDATE deployments SET message=message || ? WHERE id=?", (text+'\n',job))
 
-def deploy(project_id, *, account, project, action='deploy'):
+def deploy(project_id, *, account, project, action='deploy', queue=False):
+    """Start a job. With queue=True a busy project returns None and runs once more afterwards."""
     with _guard:
         if maintenance.is_set():
             raise DeploymentError('平台正在更新，请等待重启完成')
         lock = _locks.setdefault(project_id, threading.Lock())
         if not lock.acquire(False):
+            if queue:
+                _pending.add(project_id)
+                return None
             raise DeploymentError('已有部署正在进行')
     try:
         with db.connect() as c:
@@ -82,6 +115,32 @@ def rollback(project_id, project):
     return deploy(project_id,account={},project=project,action='rollback')
 
 def _worker(job, account, project, action, lock):
+    try:
+        _execute(job, account, project, action)
+    finally:
+        _finish(project.get('id'), lock)
+
+def _finish(project_id, lock):
+    # Release and read the pending flag in one step, so a push arriving now is either
+    # queued before this point or finds the lock free and starts its own job.
+    with _guard:
+        lock.release()
+        again = project_id in _pending
+        _pending.discard(project_id)
+    if again:
+        try:
+            _rerun(project_id)
+        except Exception:
+            pass  # e.g. the platform entered maintenance; the next push or manual update catches up
+
+def _rerun(project_id):
+    with db.connect() as c:
+        project = c.execute('SELECT * FROM projects WHERE id=?',(project_id,)).fetchone()
+        account = project and c.execute('SELECT * FROM github_accounts WHERE id=?',(project['account_id'],)).fetchone()
+    if project and account:
+        deploy(project_id,account=dict(account),project=dict(project),action='webhook',queue=True)
+
+def _execute(job, account, project, action):
     if project.get('mode') == 'existing':
         try:
             existing.execute(job,account,project,action,_note,_start,_run)
@@ -89,8 +148,6 @@ def _worker(job, account, project, action, lock):
             _note(job,'无法读取已有项目目录')
             with db.connect() as c:
                 c.execute("UPDATE deployments SET status='failed',finished_at=? WHERE id=?",(db.now(),job))
-        finally:
-            lock.release()
         return
     root = Path(project['deploy_root']).resolve()
     previous = ''
@@ -132,6 +189,13 @@ def _worker(job, account, project, action, lock):
         _note(job,'健康检查通过' if project.get('healthcheck_url') else '启动命令完成（未配置健康检查）')
         with db.connect() as c:
             c.execute("UPDATE deployments SET status='succeeded',finished_at=? WHERE id=?",(db.now(),job))
+        try:
+            # previous stays: it is the target of the next manual rollback.
+            removed=_prune(root,[target,previous])
+            if removed:
+                _note(job,f'已清理 {removed} 个旧版本目录')
+        except Exception:
+            _note(job,'旧版本目录清理未完成，可稍后手动删除')
     except Exception as exc:
         status='failed'
         _note(job,str(exc).replace(secret,'[redacted]') if secret else str(exc))
@@ -149,5 +213,3 @@ def _worker(job, account, project, action, lock):
                 _note(job,'旧版本启动失败，请检查服务日志')
         with db.connect() as c:
             c.execute('UPDATE deployments SET status=?,finished_at=? WHERE id=?',(status,db.now(),job))
-    finally:
-        lock.release()
