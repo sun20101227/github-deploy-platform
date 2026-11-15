@@ -257,6 +257,27 @@ def test_runtime_failures_explain_themselves(setup,tmp_path):
                 runtimes.restart(project,tmp_path)
 
 
+def test_running_services_are_found_without_a_directory(setup,tmp_path):
+    root,_,client=setup
+    plain=tmp_path/'not-a-repo';plain.mkdir()
+    inventory=[{'name':'demo-web-1','status':'running','project':'demo','path':str(root),'files':[str(root/'compose.yaml')]},
+               {'name':'other','status':'running','project':'','path':'','files':['']}]
+    units=[{'unit':'demo.service','path':str(root),'status':'active'},
+           {'unit':'plain.service','path':str(plain),'status':'active'},
+           {'unit':'gone.service','path':str(tmp_path/'missing'),'status':'failed'}]
+    with patch.object(discovery,'containers',return_value=(inventory,'')),patch.object(discovery,'services',return_value=units):
+        found=client.get('/api/discovery/running').json()
+        assert [p['path'] for p in found['projects']]==[str(root)]
+        item=found['projects'][0]
+        assert item['repository']=='example/demo' and not item['imported']
+        assert [c['name'] for c in item['containers']]==['demo-web-1']
+        assert [u['unit'] for u in item['services']]==['demo.service']
+        assert 'PRIVATE' not in json.dumps(found)
+        import_project(root,client)
+        assert client.get('/api/discovery/running').json()['projects'][0]['imported']
+        assert client.post('/api/discovery/scan',json={'root':str(root.parent)}).json()['projects'][0]['imported']
+
+
 def test_deployment_history_is_limited(setup):
     root,_,client=setup;p=import_project(root,client)
     with db.connect() as c:

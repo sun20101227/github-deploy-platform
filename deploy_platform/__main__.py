@@ -3,6 +3,8 @@ import os
 import subprocess
 import sys
 
+from . import config  # noqa: F401  loads .env before the settings below are read
+
 
 def supervise(command):
     env = dict(os.environ, DEPLOY_SUPERVISED='1')

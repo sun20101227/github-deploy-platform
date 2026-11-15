@@ -1,5 +1,6 @@
 """Adapters delegate container lifecycle to Compose and native services to systemd."""
 import json
+import re
 import subprocess
 from pathlib import Path
 
@@ -13,7 +14,6 @@ def validate(runtime, settings, root):
     if runtime == 'compose':
         files = settings.get('files', [])
         name = settings.get('project', '')
-        import re
         if not isinstance(name,str) or not re.fullmatch(r'[a-z0-9][a-z0-9_-]*', name) or not isinstance(files,list) or not files:
             raise RuntimeError('请填写原 Compose 项目名和配置文件')
         checked = []
@@ -41,13 +41,40 @@ def validate(runtime, settings, root):
     raise RuntimeError('不支持的运行方式')
 
 
+def validate_release(runtime, settings, repository):
+    """Settings for a project deployed into releases/<job>: the files do not exist yet,
+    so only their shape is checked here; restart() checks them inside each release."""
+    if runtime == 'command':
+        return {}
+    if runtime != 'compose':
+        raise RuntimeError('新建项目支持 Docker Compose 或自定义命令；systemd 服务请用命令 systemctl restart')
+    name = settings.get('project') or re.sub(r'[^a-z0-9_-]+', '-', repository.split('/')[-1].lower()).strip('-_')
+    files = settings.get('files') or []
+    if not isinstance(name, str) or not re.fullmatch(r'[a-z0-9][a-z0-9_-]*', name):
+        raise RuntimeError('Compose 项目名只能用小写字母、数字、横线和下划线')
+    if not isinstance(files, list) or any(
+            not isinstance(f, str) or not f or Path(f).is_absolute() or f.startswith(('/', '\\')) or '..' in Path(f).parts
+            for f in files):
+        raise RuntimeError('Compose 文件请填写仓库内的相对路径')
+    return {'project': name, 'files': files}
+
+
 def restart(project, target):
     settings = json.loads(project.get('runtime_config') or '{}')
     runtime = project.get('runtime', 'command')
     if runtime == 'compose':
+        target = Path(target)
+        if not settings.get('files'):
+            found = [f for f in discovery.COMPOSE_FILES if (target / f).is_file()][:1]
+            if not found:
+                raise RuntimeError('仓库里没有找到 compose.yaml；请在项目设置里填写 Compose 文件，或改用自定义命令')
+            settings = {**settings, 'files': found}
         settings = validate(runtime, settings, target)
+        # Releases are fresh clones without the ignored .env; share one kept beside them.
+        shared = Path(project.get('deploy_root') or target) / '.env'
+        env_files = [str(shared)] if project.get('mode') != 'existing' and shared.is_file() else []
         client = DockerClient(compose_files=settings['files'], compose_project_name=settings['project'],
-                              compose_project_directory=str(target))
+                              compose_project_directory=str(target), compose_env_files=env_files)
         # Keep the original project name so volumes/network/container ownership stay stable.
         try:
             client.compose.up(detach=True, build=True, force_recreate=True, wait=True, wait_timeout=90)

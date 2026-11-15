@@ -10,6 +10,7 @@ import time
 import uuid
 from pathlib import Path
 import httpx
+from tenacity import RetryError, Retrying, retry_if_result, stop_after_delay, wait_fixed
 from . import config, db, cli_auth, existing, runtimes
 
 class DeploymentError(RuntimeError):
@@ -60,6 +61,12 @@ def _pointer(root, target):
     tmp.write_text(str(target), encoding='utf-8')
     os.replace(tmp, root / 'current')
 
+def _healthy(url):
+    try:
+        return 200 <= httpx.get(url, timeout=2, follow_redirects=False).status_code < 300
+    except httpx.HTTPError:
+        return False
+
 def _start(project, target):
     env = os.environ.copy()
     env['DEPLOY_RELEASE_DIR'] = str(target)
@@ -70,17 +77,11 @@ def _start(project, target):
     url = project.get('healthcheck_url')
     if url:
         wait = int(project.get('healthcheck_timeout') or 45)
-        deadline = time.monotonic() + wait
-        while True:
-            try:
-                r = httpx.get(url, timeout=2, follow_redirects=False)
-                if 200 <= r.status_code < 300:
-                    return
-            except httpx.HTTPError:
-                pass
-            if time.monotonic() >= deadline:
-                raise DeploymentError(f'服务健康检查未通过（已等待 {wait} 秒）')
-            time.sleep(1)
+        try:
+            Retrying(stop=stop_after_delay(wait), wait=wait_fixed(1), sleep=time.sleep,
+                     retry=retry_if_result(lambda healthy: not healthy))(_healthy, url)
+        except RetryError:
+            raise DeploymentError(f'服务健康检查未通过（已等待 {wait} 秒）') from None
 
 def _note(job, text):
     with db.connect() as c:
@@ -186,7 +187,7 @@ def _execute(job, account, project, action):
         _pointer(root,target)
         activated=True
         _start(project,target)
-        _note(job,'健康检查通过' if project.get('healthcheck_url') else '启动命令完成（未配置健康检查）')
+        _note(job,'健康检查通过' if project.get('healthcheck_url') else '服务已重启（未配置健康检查）')
         with db.connect() as c:
             c.execute("UPDATE deployments SET status='succeeded',finished_at=? WHERE id=?",(db.now(),job))
         try:

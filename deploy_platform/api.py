@@ -47,7 +47,7 @@ class ProjectCreate(BaseModel):
     branch: str = "main"
     deploy_root: str
     build_command: str = ""
-    start_command: str
+    start_command: str = ""
     healthcheck_url: str = ""
     healthcheck_timeout: int = Field(default=45, ge=5, le=600)
     webhook_secret: str = ""
@@ -151,12 +151,26 @@ class ImportRequest(BaseModel):
     healthcheck_timeout: int = Field(default=45, ge=5, le=600)
 
 
+def _mark_imported(result):
+    with db.connect() as c:
+        roots = {str(Path(r[0]).resolve()) for r in c.execute('SELECT deploy_root FROM projects')}
+    for item in result['projects']:
+        item['imported'] = item['path'] in roots
+    return result
+
+
 @app.post('/api/discovery/scan')
 def scan_local(payload: DiscoveryRequest):
     try:
-        return discovery.scan(payload.root, payload.depth)
+        return _mark_imported(discovery.scan(payload.root, payload.depth))
     except OSError:
         raise HTTPException(400, '目录不存在或无法读取') from None
+
+
+@app.get('/api/discovery/running')
+def scan_running():
+    """Projects found from running Compose projects and systemd services; no directory needed."""
+    return _mark_imported(discovery.running())
 
 
 @app.post('/api/projects/import')
@@ -186,10 +200,10 @@ def import_project(payload: ImportRequest):
 
 @app.post("/api/projects")
 def create_project(payload: ProjectCreate):
-    if payload.runtime != 'command':
-        raise HTTPException(400, '新建项目请填写包含重启步骤的启动命令')
-    if not payload.start_command.strip():
-        raise HTTPException(400, "请填写启动命令")
+    # Compose restarts the service itself after each deployment; a command must do so on its own.
+    settings = runtimes.validate_release(payload.runtime, payload.runtime_config, payload.repository)
+    if payload.runtime == 'command' and not payload.start_command.strip():
+        raise HTTPException(400, "请填写启动命令，或把运行方式改为 Docker Compose")
     with db.connect() as conn:
         if not conn.execute("SELECT 1 FROM github_accounts WHERE id=?", (payload.account_id,)).fetchone():
             raise HTTPException(404, "GitHub 账号不存在")
@@ -202,11 +216,11 @@ def create_project(payload: ProjectCreate):
         timestamp = db.now()
         webhook_secret = payload.webhook_secret or secrets.token_hex(32)
         cursor = conn.execute(
-            "INSERT INTO projects(account_id, repository, branch, deploy_root, build_command, start_command, healthcheck_url, webhook_secret, created_at, updated_at, healthcheck_timeout) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO projects(account_id, repository, branch, deploy_root, build_command, start_command, healthcheck_url, webhook_secret, created_at, updated_at, healthcheck_timeout, runtime, runtime_config) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (payload.account_id, payload.repository, payload.branch, payload.deploy_root,
              payload.build_command, payload.start_command, payload.healthcheck_url,
              webhook_secret,
-             timestamp, timestamp, payload.healthcheck_timeout),
+             timestamp, timestamp, payload.healthcheck_timeout, payload.runtime, json.dumps(settings)),
         )
         return {"id": cursor.lastrowid, "webhook_secret": webhook_secret}
 
@@ -335,8 +349,11 @@ def project_detail(project_id: int):
 @app.put("/api/projects/{project_id}")
 def edit_project(project_id: int, payload: ProjectCreate):
     project = project_detail(project_id)
-    runtime = payload.runtime if project['mode'] == 'existing' else 'command'
-    settings = runtimes.validate(runtime, payload.runtime_config, project['deploy_root'])
+    runtime = payload.runtime
+    if project['mode'] == 'existing':
+        settings = runtimes.validate(runtime, payload.runtime_config, project['deploy_root'])
+    else:
+        settings = runtimes.validate_release(runtime, payload.runtime_config, project['repository'])
     if runtime == 'command' and not payload.start_command.strip():
         raise HTTPException(400, "请填写重启命令")
     with db.connect() as conn:

@@ -100,10 +100,33 @@ def scan(root, depth=2):
         if (p/'.git').exists():
             dirs[:] = []
             try:
-                item = inspect(p)
-                item['containers'] = [c for c in inventory if c['path'] and Path(c['path']).resolve() == p.resolve()]
-                item['services'] = [u for u in units if Path(u['path']).resolve() == p.resolve()]
-                found.append(item)
+                found.append(_attach(inspect(p), inventory, units))
             except (RuntimeError, OSError):
                 continue
     return {'projects': found, 'containers': inventory, 'warnings': warnings}
+
+
+def _attach(item, inventory, units):
+    root = Path(item['path'])
+    item['containers'] = [c for c in inventory if c['path'] and Path(c['path']).resolve() == root]
+    item['services'] = [u for u in units if Path(u['path']).resolve() == root]
+    return item
+
+
+def running():
+    """Start from what runs here: Compose working directories and systemd WorkingDirectory."""
+    inventory, warning = containers()
+    units = services()
+    found, seen = [], set()
+    for value in [c['path'] for c in inventory] + [u['path'] for u in units]:
+        if not value or value in seen or len(seen) >= 300:
+            continue
+        seen.add(value)
+        try:
+            path = Path(value).resolve(strict=True)
+            if path == Path(path.anchor) or any(f['path'] == str(path) for f in found):
+                continue
+            found.append(_attach(inspect(path), inventory, units))
+        except (RuntimeError, OSError):
+            continue  # not a Git checkout, unreadable, or the platform itself
+    return {'projects': found, 'containers': inventory, 'warnings': [warning] if warning else []}

@@ -16,7 +16,7 @@ export DEPLOY_ADMIN_TOKEN='替换成随机管理密钥'
 .venv/bin/python -m deploy_platform
 ```
 
-Windows 使用 `.venv/Scripts/python -m deploy_platform`，环境变量用 PowerShell 的 `$env:DEPLOY_ADMIN_TOKEN` 设置。通过 `DEPLOY_HOST`、`DEPLOY_PORT` 调整监听地址和端口。配置通过环境变量读取；`.env.example` 不会自动加载。Linux 常驻运行可参考 [systemd 配置](deploy/deploy-platform.service)，由 systemd 的 `EnvironmentFile` 加载环境变量。
+Windows 使用 `.venv/Scripts/python -m deploy_platform`，环境变量用 PowerShell 的 `$env:DEPLOY_ADMIN_TOKEN` 设置。通过 `DEPLOY_HOST`、`DEPLOY_PORT` 调整监听地址和端口。配置通过环境变量读取；把 `.env.example` 复制为项目根目录的 `.env` 后会在启动时自动加载，已经设置的环境变量优先。Linux 常驻运行可参考 [systemd 配置](deploy/deploy-platform.service)，由 systemd 的 `EnvironmentFile` 加载环境变量。
 
 在 HTTPS 反向代理后使用，管理密钥在网页解锁时输入，仅存在当前浏览器会话。未设置密钥只允许本机直连开发访问；反向代理必须传递 `X-Forwarded-For`。当前使用单进程运行，不要设置多个 workers。
 
@@ -25,7 +25,7 @@ Windows 使用 `.venv/Scripts/python -m deploy_platform`，环境变量用 Power
 - **项目**：搜索项目、查看最新任务状态。
 - **项目详情**：概览、部署记录、设置分开显示；部署进行中自动刷新记录。部署记录显示最近 50 条。
 - **新建项目**：选择账号和仓库，填写运行配置。仓库列表按最近更新排序，最多读取 1000 个。
-- **已有项目**：扫描当前服务器上的目录，识别 Git 仓库、关联的 Compose 容器和 systemd 服务，再接入管理。
+- **已有项目**：打开页面就从正在运行的 Compose 项目和 systemd 服务找到它们所在的 Git 仓库，不需要先知道目录；也可以扫描指定目录。识别仓库、关联的容器和服务，再接入管理；已接入的会标出。
 - **GitHub**：连接服务器的 `gh` 账号；不要求创建 OAuth App。服务用户必须能读取自己的 gh 凭据，容器不能自动读取宿主机的登录状态。
 - **平台更新**：检查并快进更新平台自身的 Git 分支，安装更新后的 Python 依赖，自动重启。页面用进程实例编号确认服务恢复；正在部署其他项目时禁止更新平台。
 
@@ -55,7 +55,11 @@ Windows 使用 `.venv/Scripts/python -m deploy_platform`，环境变量用 Power
   releases/<任务号>/   # 每次部署的独立代码目录
 ```
 
-这一目录结构仅用于“新建项目”；接入已有项目不会改造目录。构建和启动命令在新版本目录执行。启动命令必须执行启动或重启并及时退出，不能直接运行前台常驻进程。Compose 命令应固定项目名，例如 `docker compose -p my-app up -d --build --force-recreate --wait`，防止每个版本另建一套容器。启动时额外提供 `DEPLOY_RELEASE_DIR`、`DEPLOY_PROJECT_ROOT` 环境变量。若使用 systemd，自行配置服务读取正确的版本路径；`current` 是文本指针，不是目录链接。
+这一目录结构仅用于“新建项目”；接入已有项目不会改造目录。
+
+新建项目默认用 **Docker Compose** 在每次部署、自动更新和回滚后重建并重启服务，不需要填写命令：项目名留空时使用仓库名并保持不变，Compose 文件留空时自动识别仓库根目录的 `compose.yaml` 等文件。每个版本目录是全新克隆，不含被忽略的 `.env`；把它放在 `项目目录/.env`，平台会用 `--env-file` 传给 Compose。绑定挂载的相对路径会随版本目录变化，持久数据请用命名卷或版本目录之外的绝对路径。
+
+不使用 Compose 时选择“自定义命令”。构建和启动命令在新版本目录执行。启动命令必须执行启动或重启并及时退出，不能直接运行前台常驻进程。Compose 命令应固定项目名，例如 `docker compose -p my-app up -d --build --force-recreate --wait`，防止每个版本另建一套容器。启动时额外提供 `DEPLOY_RELEASE_DIR`、`DEPLOY_PROJECT_ROOT` 环境变量。若使用 systemd，自行配置服务读取正确的版本路径；`current` 是文本指针，不是目录链接。
 
 设置健康检查 URL 后，启动成功还必须返回 HTTP 2xx。每秒检查一次，默认最长等待 45 秒，可在项目设置里调整为 5–600 秒。切换失败会恢复旧指针、重新执行旧版本启动命令并检查健康；结果写入部署记录。首次部署没有旧版可恢复，可能需要在进程管理器中清理失败进程。回滚只处理代码，不回退数据库。持久数据应放在版本目录之外。
 

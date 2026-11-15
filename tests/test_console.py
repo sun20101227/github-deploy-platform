@@ -150,6 +150,40 @@ def test_successful_deploy_prunes_and_stays_successful(client,tmp_path):
     assert not lock.locked()
 
 
+def test_new_project_restarts_through_compose_without_a_command(client,tmp_path):
+    import json
+    from deploy_platform import runtimes
+    base={'account_id':1,'repository':'test/My.App','deploy_root':str(tmp_path/'compose-app'),'runtime':'compose'}
+    for bad in ({'runtime':'systemd','runtime_config':{'unit':'x.service'}},
+                {'runtime_config':{'files':['../outside.yaml']}},
+                {'runtime_config':{'files':[str(tmp_path/'abs.yaml')]}},
+                {'runtime_config':{'project':'Bad Name'}},
+                {'runtime':'command'}):
+        assert client.post('/api/projects',json={**base,**bad}).status_code in (400,409)
+    r=client.post('/api/projects',json=base)
+    assert r.status_code==200,r.text
+    p=client.get(f"/api/projects/{r.json()['id']}").json()
+    assert p['runtime']=='compose' and p['start_command']==''
+    assert json.loads(p['runtime_config'])=={'project':'my-app','files':[]}
+    # Each release is a fresh clone: the compose file is found there, the shared .env beside releases/.
+    root=Path(p['deploy_root']);release=root/'releases'/'7';release.mkdir(parents=True)
+    with patch.object(runtimes,'DockerClient') as docker:
+        with pytest.raises(RuntimeError,match='没有找到 compose.yaml'):
+            runtimes.restart(p,release)
+        (release/'docker-compose.yml').write_text('services: {}')
+        (root/'.env').write_text('TOKEN=1')
+        assert runtimes.restart(p,release)
+        options=docker.call_args.kwargs
+        assert options['compose_project_name']=='my-app'
+        assert options['compose_files']==[str((release/'docker-compose.yml').resolve())]
+        assert options['compose_env_files']==[str(root/'.env')]
+        docker.return_value.compose.up.assert_called_once()
+    # The settings page can switch an existing release project between the two ways.
+    assert client.put(f"/api/projects/{p['id']}",json={**p,'runtime':'command','start_command':'pm2 restart app'}).status_code==200
+    assert client.put(f"/api/projects/{p['id']}",json={**p,'runtime_config':{'project':'my-app','files':['deploy/compose.yaml']}}).status_code==200
+    assert json.loads(client.get(f"/api/projects/{p['id']}").json()['runtime_config'])['files']==['deploy/compose.yaml']
+
+
 def test_invalid_root_and_duplicate_directory(client,tmp_path):
     p=project(client,tmp_path)
     assert client.post('/api/projects',json=p).status_code==409

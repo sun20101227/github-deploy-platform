@@ -15,7 +15,9 @@ function bindRuntime(form) {
     command.required = select.value==='command';
     command.closest('label').hidden = select.value!=='command';
     for (const name of ['compose_project','compose_files','unit']) {
-      form.querySelector(`[name=${name}]`).required = name==='unit' ? select.value==='systemd' : select.value==='compose';
+      const input = form.querySelector(`[name=${name}]`);
+      // New projects have no systemd field, and their Compose fields may stay empty.
+      if (input) input.required = !('optional' in input.dataset) && (name==='unit' ? select.value==='systemd' : select.value==='compose');
     }
   }
   select.onchange=toggle;
@@ -31,30 +33,43 @@ function readRuntime(form) {
 async function discoveryPage(t) {
   const accounts=await api('/api/accounts');
   if(t!==epoch)return;
-  $('#content').innerHTML=header('已有项目','读取这台服务器上的仓库和服务。')+`
-    <form id="scan-form" class="scan-form"><label>项目所在目录<input id="scan-root" required placeholder="例如 /opt 或 /srv/apps"></label><button class="primary">扫描目录</button></form>
-    <p id="error" class="error" role="alert"></p><div id="scan-results"></div>`;
+  $('#content').innerHTML=header('已有项目','读取这台服务器上正在运行的服务和它们的仓库。')+`
+    <form id="scan-form" class="scan-form"><label>扫描其他目录<input id="scan-root" required placeholder="例如 /opt 或 /srv/apps"></label><button class="primary">扫描目录</button></form>
+    <p id="error" class="error" role="alert"></p><div id="scan-results"><p class="loading" role="status">正在读取运行中的服务…</p></div>`;
+  function show(result,title,emptyText) {
+    function render() {
+      $('#scan-results').innerHTML=result.warnings.map(w=>`<p class="notice">${esc(w)}</p>`).join('')+
+        `<section class="section"><h2>${esc(title(result.projects.length))}</h2><div class="sheet">${result.projects.map((p,i)=>`
+          <div class="discovery-row"><div><strong>${esc(p.name)}</strong><small class="repo-path">${esc(p.path)}</small><small>${esc(p.repository||'非 GitHub 仓库')} · ${esc(p.branch||'未检出分支')}${p.dirty?' · 有本地修改':''}</small></div>
+          <div class="runtime-hint">${p.containers.length?`Compose · ${p.containers.length} 个容器`:p.services.length?esc(p.services.map(s=>s.unit).join('、')):'待设置重启方式'}</div>
+          <button class="pick-project" data-index="${i}" ${p.imported||!p.repository||!p.branch?'disabled':''}>${p.imported?'已接入':'接入'}</button></div>`).join('')||`<p class="empty">${esc(emptyText)}</p>`}</div></section>
+        <details class="container-list"><summary>Docker 容器 · ${result.containers.length}</summary>${result.containers.map(c=>`<p><strong>${esc(c.name)}</strong> · ${esc(c.status)}<br><small>${esc(c.path||'未标注源码目录')}</small></p>`).join('')||'<p class="muted">没有可读取的容器。</p>'}</details>`;
+      document.querySelectorAll('.pick-project').forEach(b=>b.onclick=()=>importForm(result.projects[Number(b.dataset.index)],accounts,render));
+    }
+    render();
+  }
+  let manual=false;
   $('#scan-form').onsubmit=e=>{
     e.preventDefault();
+    manual=true;
     busy(e.submitter,async()=>{
       e.submitter.textContent='正在扫描…';
       try {
         const result=await api('/api/discovery/scan',{root:$('#scan-root').value,depth:3});
         if(t!==epoch)return;
         $('#error').textContent='';
-        function render() {
-          $('#scan-results').innerHTML=result.warnings.map(w=>`<p class="notice">${esc(w)}</p>`).join('')+
-            `<section class="section"><h2>找到 ${result.projects.length} 个仓库</h2><div class="sheet">${result.projects.map((p,i)=>`
-              <div class="discovery-row"><div><strong>${esc(p.name)}</strong><small class="repo-path">${esc(p.path)}</small><small>${esc(p.repository||'非 GitHub 仓库')} · ${esc(p.branch||'未检出分支')}${p.dirty?' · 有本地修改':''}</small></div>
-              <div class="runtime-hint">${p.containers.length?`Compose · ${p.containers.length} 个容器`:p.services.length?esc(p.services.map(s=>s.unit).join('、')):'待设置重启方式'}</div>
-              <button class="pick-project" data-index="${i}" ${!p.repository||!p.branch?'disabled':''}>接入</button></div>`).join('')||'<p class="empty">这个目录下没有找到 Git 仓库。</p>'}</div></section>
-            <details class="container-list"><summary>Docker 容器 · ${result.containers.length}</summary>${result.containers.map(c=>`<p><strong>${esc(c.name)}</strong> · ${esc(c.status)}<br><small>${esc(c.path||'未标注源码目录')}</small></p>`).join('')||'<p class="muted">没有可读取的容器。</p>'}</details>`;
-          document.querySelectorAll('.pick-project').forEach(b=>b.onclick=()=>importForm(result.projects[Number(b.dataset.index)],accounts,render));
-        }
-        render();
+        show(result,n=>`找到 ${n} 个仓库`,'这个目录下没有找到 Git 仓库。');
       } finally {e.submitter.textContent='扫描目录'}
     });
   };
+  // No directory needed: start from the Compose projects and systemd services that are running.
+  try {
+    const result=await api('/api/discovery/running');
+    if(t!==epoch||manual)return;
+    show(result,n=>`运行中的服务对应 ${n} 个仓库`,'没有从运行中的 Compose 项目或 systemd 服务找到 Git 仓库，可以在上面扫描目录。');
+  } catch(e) {
+    if(t===epoch&&!manual){$('#scan-results').innerHTML='';inlineError(e)}
+  }
 }
 
 function importForm(p,accounts,back) {
