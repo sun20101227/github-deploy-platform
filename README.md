@@ -56,6 +56,23 @@ DEPLOY_SECRET_KEY
 
 `git` 本身没有网页登录流程。`gh auth login` 保存的是某一台服务器上的单个 CLI 账号，适合单管理员部署；它不能实现网页上选择多个 GitHub 账号。多账号网页登录需要 OAuth App，服务器只保存每个账号自己的授权令牌。
 
+## 更新平台本体
+
+部署平台自己也支持 Git 更新。服务器首次配置：
+
+```bash
+gh auth login
+```
+
+之后在管理页面点击“检查本体更新”或调用：
+
+```text
+POST /api/self-update/check
+POST /api/self-update/apply
+```
+
+平台会通过 `gh auth token` 获取当前机器的 GitHub CLI 凭证，执行 `git fetch` 和 `git pull --ff-only`。工作区有未提交修改、远端历史发生分叉或没有 `gh` 登录时都会拒绝更新。更新完成后需要由 systemd、Docker 编排或启动脚本重新拉起进程。
+
 部署命令目前故意保持为项目配置的一部分，后续可以增加 Docker、systemd 和多服务器 Agent 适配器。
 
 ## Webhook

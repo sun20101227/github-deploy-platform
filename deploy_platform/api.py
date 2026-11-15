@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 
 from . import db, github
 from .deployer import DeploymentError, deploy, rollback
+from . import self_update
 
 app = FastAPI(title="GitHub Deploy Platform", version="0.1.0")
 db.init()
@@ -83,6 +84,27 @@ def projects():
         return [dict(row) for row in conn.execute(
             "SELECT p.*, a.login AS github_login FROM projects p JOIN github_accounts a ON a.id=p.account_id ORDER BY p.id DESC"
         )]
+
+
+@app.get("/api/self-update")
+def self_update_status():
+    return self_update.status()
+
+
+@app.post("/api/self-update/check")
+def self_update_check():
+    try:
+        return self_update.check()
+    except RuntimeError as exc:
+        raise HTTPException(503, str(exc)) from exc
+
+
+@app.post("/api/self-update/apply")
+def self_update_apply():
+    try:
+        return self_update.apply()
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc)) from exc
 
 
 @app.post("/api/projects")
