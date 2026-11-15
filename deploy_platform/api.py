@@ -5,7 +5,7 @@ import hmac
 import secrets
 import httpx
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 from pathlib import Path
@@ -259,9 +259,9 @@ def rollback_project(project_id: int):
 
 
 @app.get("/api/projects/{project_id}/deployments")
-def deployments(project_id: int):
+def deployments(project_id: int, limit: int = Query(50, ge=1, le=200)):
     with db.connect() as conn:
-        return [dict(row) for row in conn.execute("SELECT * FROM deployments WHERE project_id=? ORDER BY id DESC", (project_id,))]
+        return [dict(row) for row in conn.execute("SELECT * FROM deployments WHERE project_id=? ORDER BY id DESC LIMIT ?", (project_id, limit))]
 
 
 @app.post("/webhooks/github/{project_id}")

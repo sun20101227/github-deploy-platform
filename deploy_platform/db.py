@@ -78,6 +78,7 @@ def init() -> None:
             columns = {row[1] for row in conn.execute(f'PRAGMA table_info({table})')}
             if name not in columns:
                 conn.execute(f'ALTER TABLE {table} ADD COLUMN {name} {definition}')
+        conn.execute('CREATE INDEX IF NOT EXISTS deployments_by_project ON deployments(project_id, id)')
 
 
 def recover_interrupted() -> int:

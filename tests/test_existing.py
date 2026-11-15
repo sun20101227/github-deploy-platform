@@ -234,6 +234,41 @@ def test_discovery_associates_native_services(setup):
         assert run.call_args_list[1].args[0]==['systemctl','is-active','--quiet','demo.service']
 
 
+def test_runtime_failures_explain_themselves(setup,tmp_path):
+    import subprocess
+    from python_on_whales.exceptions import DockerException
+    root,_,_=setup
+    project={'runtime':'systemd','runtime_config':json.dumps({'unit':'demo.service'})}
+    failed=subprocess.CalledProcessError(1,'systemctl',stderr='Job for demo.service failed because the control process exited')
+    cases=[([failed],'control process exited'),
+           ([subprocess.TimeoutExpired('systemctl',120)],'超过 120 秒'),
+           ([Mock(),subprocess.CalledProcessError(3,'systemctl')],'journalctl -u demo.service')]
+    for effects,expected in cases:
+        with patch.object(discovery,'service_directory',return_value=str(root)),patch.object(runtimes.subprocess,'run',side_effect=effects):
+            with pytest.raises(RuntimeError,match=expected):
+                runtimes.restart(project,root)
+    file=tmp_path/'compose.yaml';file.write_text('services: {}')
+    project={'runtime':'compose','runtime_config':json.dumps({'project':'existing-app','files':[str(file)]})}
+    for error,expected in [(DockerException(['docker','compose','up'],17),'退出码 17.*服务日志'),
+                           (DockerException(['docker','compose','up'],1,stderr=b'port is already allocated'),'port is already allocated')]:
+        with patch.object(runtimes,'DockerClient') as docker:
+            docker.return_value.compose.up.side_effect=error
+            with pytest.raises(RuntimeError,match=expected):
+                runtimes.restart(project,tmp_path)
+
+
+def test_deployment_history_is_limited(setup):
+    root,_,client=setup;p=import_project(root,client)
+    with db.connect() as c:
+        for _ in range(60):
+            c.execute("INSERT INTO deployments(project_id,action,status,started_at) VALUES (?,'deploy','failed',?)",(p['id'],db.now()))
+    url=f"/api/projects/{p['id']}/deployments"
+    ids=[j['id'] for j in client.get(url).json()]
+    assert len(ids)==50 and ids==sorted(ids,reverse=True)
+    assert len(client.get(url+'?limit=1').json())==1
+    assert client.get(url+'?limit=0').status_code==422
+
+
 def test_remote_cannot_overwrite_ignored_configuration(setup):
     root,repo,client=setup;p=import_project(root,client)
     before=repo.head.commit.hexsha
