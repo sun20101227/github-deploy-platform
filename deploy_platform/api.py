@@ -37,7 +37,10 @@ def health():
 
 @app.get("/auth/github/start")
 def github_start():
-    url, state = github.authorization_url()
+    try:
+        url, state = github.authorization_url()
+    except RuntimeError as exc:
+        raise HTTPException(503, str(exc)) from exc
     oauth_states.add(state)
     return RedirectResponse(url)
 

@@ -44,6 +44,18 @@ GITHUB_REDIRECT_URI=http://127.0.0.1:8000/auth/github/callback
 DEPLOY_SECRET_KEY
 ```
 
+## 配置 GitHub 登录
+
+在 GitHub 的 Settings → Developer settings → OAuth Apps → New OAuth App 创建应用：
+
+- Application name：例如 `Deploy Platform`
+- Homepage URL：部署平台首页
+- Authorization callback URL：`https://你的域名/auth/github/callback`
+
+把生成的 Client ID 和 Client Secret 写入服务器环境变量后重启服务。没有配置时，登录按钮会直接提示配置缺失，不会再打开一个 `client_id=` 为空的 GitHub 地址。
+
+`git` 本身没有网页登录流程。`gh auth login` 保存的是某一台服务器上的单个 CLI 账号，适合单管理员部署；它不能实现网页上选择多个 GitHub 账号。多账号网页登录需要 OAuth App，服务器只保存每个账号自己的授权令牌。
+
 部署命令目前故意保持为项目配置的一部分，后续可以增加 Docker、systemd 和多服务器 Agent 适配器。
 
 ## Webhook

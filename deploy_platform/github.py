@@ -9,6 +9,11 @@ from . import config
 
 
 def authorization_url() -> tuple[str, str]:
+    if not config.GITHUB_CLIENT_ID or not config.GITHUB_CLIENT_SECRET:
+        raise RuntimeError(
+            "GitHub OAuth 尚未配置：请设置 GITHUB_CLIENT_ID 和 GITHUB_CLIENT_SECRET，"
+            "或改用服务器端 Deploy Key 模式。"
+        )
     state = secrets.token_urlsafe(32)
     query = urlencode(
         {
