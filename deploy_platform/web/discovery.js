@@ -40,7 +40,7 @@ async function discoveryPage(t) {
     function render() {
       $('#scan-results').innerHTML=result.warnings.map(w=>`<p class="notice">${esc(w)}</p>`).join('')+
         `<section class="section"><h2>${esc(title(result.projects.length))}</h2><div class="sheet">${result.projects.map((p,i)=>`
-          <div class="discovery-row"><div><strong>${esc(p.name)}</strong><small class="repo-path">${esc(p.path)}</small><small>${esc(p.repository||'非 GitHub 仓库')} · ${esc(p.branch||'未检出分支')}${p.dirty?' · 有本地修改':''}</small></div>
+          <div class="discovery-row" style="--i:${i}"><div><strong>${esc(p.name)}</strong><small class="repo-path">${esc(p.path)}</small><small>${esc(p.repository||'非 GitHub 仓库')} · ${esc(p.branch||'未检出分支')}${p.dirty?' · 有本地修改':''}</small></div>
           <div class="runtime-hint">${p.containers.length?`Compose · ${p.containers.length} 个容器`:p.services.length?esc(p.services.map(s=>s.unit).join('、')):'待设置重启方式'}</div>
           <button class="pick-project" data-index="${i}" ${p.imported||!p.repository||!p.branch?'disabled':''}>${p.imported?'已接入':'接入'}</button></div>`).join('')||`<p class="empty">${esc(emptyText)}</p>`}</div></section>
         <details class="container-list"><summary>Docker 容器 · ${result.containers.length}</summary>${result.containers.map(c=>`<p><strong>${esc(c.name)}</strong> · ${esc(c.status)}<br><small>${esc(c.path||'未标注源码目录')}</small></p>`).join('')||'<p class="muted">没有可读取的容器。</p>'}</details>`;
