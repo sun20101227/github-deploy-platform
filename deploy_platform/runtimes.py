@@ -38,9 +38,30 @@ def validate(runtime, settings, root):
         if not directory or not discovery._under(directory, root):
             raise RuntimeError('服务的 WorkingDirectory 不在项目目录里，请使用自定义重启命令')
         return {'unit': unit}
+    if runtime == 'container':
+        # A container started with docker run (no Compose): restarted as it is, never recreated.
+        name = settings.get('container', '')
+        if not isinstance(name, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]*', name):
+            raise RuntimeError('请填写容器名')
+        try:
+            client = _docker()
+            try:
+                client.containers.get(name)
+            finally:
+                client.close()
+        except RuntimeError:
+            raise
+        except Exception:
+            raise RuntimeError(f'找不到容器 {name}，或者 Docker 不可用') from None
+        return {'container': name}
     if runtime == 'command':
         return {}
     raise RuntimeError('不支持的运行方式')
+
+
+def _docker():
+    import docker
+    return docker.from_env(timeout=5)
 
 
 def validate_release(runtime, settings, repository):
@@ -105,16 +126,43 @@ def restart(project, target, pull=False):
         except subprocess.SubprocessError:
             raise RuntimeError(f'{unit} 重启后未处于运行状态，请查看 journalctl -u {unit}') from None
         return True
+    if runtime == 'container':
+        name = settings.get('container', '')
+        client = _docker()
+        try:
+            container = client.containers.get(name)
+            container.restart(timeout=30)
+            container.reload()
+            if container.status != 'running':
+                raise RuntimeError(f'容器 {name} 重启后状态是 {container.status}，请查看容器日志')
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            raise RuntimeError(f'重启容器 {name} 失败：{str(exc)[-300:]}') from None
+        finally:
+            client.close()
+        return True
     return False
 
 
 # ---- Is it running, and what is it printing? Read only. ----
 
 def _compose_containers(name):
-    import docker
-    client = docker.from_env(timeout=5)
+    client = _docker()
     try:
         return client, client.containers.list(all=True, filters={'label': f'com.docker.compose.project={name}'})
+    except Exception:
+        client.close()
+        raise
+
+
+def _project_containers(runtime, settings):
+    """(client, containers) for a Compose project or a single docker run container."""
+    if runtime == 'compose' and settings.get('project'):
+        return _compose_containers(settings['project'])
+    client = _docker()
+    try:
+        return client, [client.containers.get(settings['container'])]
     except Exception:
         client.close()
         raise
@@ -132,13 +180,14 @@ def status(project):
     """{'state': running|degraded|stopped|unknown, 'detail': text, 'items': [...], 'health': True/False/None}."""
     settings = json.loads(project.get('runtime_config') or '{}')
     runtime = project.get('runtime', 'command')
-    items, note = [], ''
+    items, note, ports = [], '', set()
     try:
-        if runtime == 'compose' and settings.get('project'):
-            client, containers = _compose_containers(settings['project'])
+        if (runtime == 'compose' and settings.get('project')) or (runtime == 'container' and settings.get('container')):
+            client, containers = _project_containers(runtime, settings)
             try:
                 for c in containers:
                     state = c.attrs.get('State', {})
+                    ports.update(discovery._host_ports(c.attrs))
                     items.append({'name': c.name, 'state': c.status, 'health': (state.get('Health') or {}).get('Status', ''),
                                   'since': state.get('StartedAt', '') if c.status == 'running' else state.get('FinishedAt', ''),
                                   'restarts': c.attrs.get('RestartCount', 0)})
@@ -158,8 +207,9 @@ def status(project):
             items.append({'name': settings['unit'], 'state': 'running' if active == 'active' else active,
                           'health': data.get('SubState', ''), 'since': since,
                           'restarts': int(data.get('NRestarts') or 0)})
+            ports.update(p for p, unit in discovery.listeners().items() if unit == settings['unit'])
     except Exception:
-        note = 'Docker 未运行或当前用户无访问权限' if runtime == 'compose' else '读不到服务状态'
+        note = 'Docker 未运行、找不到容器，或当前用户无访问权限' if runtime in ('compose', 'container') else '读不到服务状态'
     health = _healthy(project['healthcheck_url']) if project.get('healthcheck_url') else None
     if items:
         running = [i for i in items if i['state'] == 'running' and i['health'] not in ('unhealthy',)]
@@ -174,7 +224,9 @@ def status(project):
         note = '自定义命令的项目只能通过健康检查判断' if health is None else ''
     if state == 'running' and health is False:
         state, note = 'degraded', '进程在运行，但健康检查没有通过'
-    return {'state': state, 'detail': note, 'items': items, 'health': health}
+    # Which public domains reach this service, from the reverse proxy's site configs.
+    domains = sorted({d for s in discovery.sites() if ports & set(s['ports']) for d in s['domains']}) if ports else []
+    return {'state': state, 'detail': note, 'items': items, 'health': health, 'ports': sorted(ports), 'domains': domains}
 
 
 def logs(project, lines=200):
@@ -185,8 +237,8 @@ def logs(project, lines=200):
         r = subprocess.run(['journalctl', '-u', settings['unit'], '-n', str(lines), '--no-pager', '-o', 'short-iso'],
                            capture_output=True, text=True, timeout=15)
         return {'source': f"journalctl -u {settings['unit']}", 'text': r.stdout or r.stderr or '没有日志'}
-    if runtime == 'compose' and settings.get('project'):
-        client, containers = _compose_containers(settings['project'])
+    if (runtime == 'compose' and settings.get('project')) or (runtime == 'container' and settings.get('container')):
+        client, containers = _project_containers(runtime, settings)
         try:
             parts = []
             for c in sorted(containers, key=lambda c: c.name):
@@ -194,5 +246,6 @@ def logs(project, lines=200):
                 parts.append(f'== {c.name} ==\n{text}' if len(containers) > 1 else text)
         finally:
             client.close()
-        return {'source': f"docker compose -p {settings['project']} logs", 'text': '\n'.join(parts) or '没有日志'}
+        source = f"docker compose -p {settings['project']} logs" if runtime == 'compose' else f"docker logs {settings['container']}"
+        return {'source': source, 'text': '\n'.join(parts) or '没有日志'}
     raise RuntimeError('自定义命令的项目看不到服务日志：平台不知道它把输出写到了哪里')

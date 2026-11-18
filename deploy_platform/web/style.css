@@ -283,6 +283,9 @@ summary{cursor:pointer;font-size:13px;color:var(--ink)}
 .discovery-row small{display:block;margin-top:4px;font-size:12px}
 .repo-path{overflow-wrap:anywhere}
 .discovery-row small.note{color:var(--warn);margin-top:6px}
+.discovery-row small.domains{display:flex;flex-wrap:wrap;gap:4px 12px}
+.discovery-row small.domains a,.info a.domain{color:var(--accent-ink);border-bottom:1px dashed var(--line-strong)}
+.runtime-hint{line-height:1.7}
 .hero .error{margin-bottom:0}
 .runtime-hint{color:var(--muted);font-size:12px;overflow-wrap:anywhere}
 .container-list p{padding:12px 0;margin:0;border-bottom:1px solid var(--line)}

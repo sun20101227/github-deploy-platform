@@ -168,7 +168,7 @@ class ProjectCreate(BaseModel):
     healthcheck_url: str = ""
     healthcheck_timeout: int = Field(default=45, ge=5, le=600)
     webhook_secret: str = ""
-    runtime: Literal['command','compose','systemd'] = 'command'
+    runtime: Literal['command','compose','systemd','container'] = 'command'
     runtime_config: dict = Field(default_factory=dict)
 
     @field_validator('runtime_config', mode='before')
@@ -277,7 +277,7 @@ class DiscoveryRequest(BaseModel):
 class ImportRequest(BaseModel):
     path: str
     account_id: int
-    runtime: Literal['command','compose','systemd'] = 'command'
+    runtime: Literal['command','compose','systemd','container'] = 'command'
     runtime_config: dict = Field(default_factory=dict)
     start_command: str = ''
     build_command: str = ''

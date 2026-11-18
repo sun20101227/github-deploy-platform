@@ -98,6 +98,7 @@ function runtimeText(p){
   const s = JSON.parse(p.runtime_config || '{}');
   if(p.runtime==='compose') return `Docker Compose · ${esc(s.project || '仓库名')}${s.files?.length ? `<br><small>${esc(s.files.map(f=>f.split(/[\\/]/).pop()).join('、'))}</small>` : ''}`;
   if(p.runtime==='systemd') return `systemd · ${esc(s.unit)}`;
+  if(p.runtime==='container') return `Docker 容器 · ${esc(s.container)}<br><small>docker restart，不换镜像</small>`;
   return `自定义命令<br><code>${esc(p.start_command || '—')}</code>`;
 }
 
@@ -114,10 +115,11 @@ async function serviceCard(p, id, active, t){
   let s;
   try { s = await api(`/api/projects/${id}/status`) } catch(e) { s = {state:'unknown', detail:e.message, items:[], health:null} }
   const card = $('#svc'); if(t!==epoch || !card) return;
-  const canLogs = p.runtime==='compose' || p.runtime==='systemd';
+  const canLogs = ['compose','systemd','container'].includes(p.runtime);
   card.innerHTML = `<h2>服务 ${svcBadge(s.state)}</h2>${s.detail?`<p class="state-line">${esc(s.detail)}</p>`:''}
     ${s.items.length?`<ul class="svc-list">${s.items.map(i=>`<li><span class="svc-dot ${i.state==='running'&&i.health!=='unhealthy'?'running':i.state==='running'?'degraded':'stopped'}"></span><strong>${esc(i.name)}</strong><span>${esc(STATE_NAMES[i.state]||i.state)}${i.health&&i.health!=='running'?' · '+esc(i.health==='healthy'?'健康':i.health==='unhealthy'?'不健康':i.health):''}${since(i.since)?` · ${i.state==='running'?'启动于':'停止于'} ${esc(since(i.since))}`:''}${i.restarts?` · 重启过 ${i.restarts} 次`:''}</span></li>`).join('')}</ul>`:''}
     ${s.health===null?'':`<p class="state-line">健康检查 ${s.health?'<span class="badge succeeded">通过</span>':'<span class="badge failed">未通过</span>'} <small>${esc(p.healthcheck_url)}</small></p>`}
+    ${s.domains?.length||s.ports?.length?`<p class="state-line">${s.domains?.length?'访问地址 '+s.domains.map(d=>`<a class="sha" href="https://${esc(d)}" target="_blank" rel="noopener noreferrer">${esc(d)}</a>`).join(' '):''}${s.ports?.length?` <small>本机端口 ${esc(s.ports.join('、'))}</small>`:''}</p>`:''}
     <div class="buttons"><button id="svc-restart" ${active?'disabled':''}>重启服务</button>${canLogs?`<button id="svc-logs-btn" aria-expanded="${logsOpen===id}">${logsOpen===id?'收起日志':'查看服务日志'}</button>`:''}<button class="text" id="svc-refresh">刷新状态</button></div><div id="svc-logs"></div>`;
   $('#svc-refresh').onclick = ()=>serviceCard(p, id, active, t);
   $('#svc-restart').onclick = async e=>{
