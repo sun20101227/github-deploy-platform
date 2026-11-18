@@ -126,11 +126,11 @@ def _healthy(url):
     except httpx.HTTPError:
         return False
 
-def _start(project, target, job=None):
+def _start(project, target, job=None, pull=False):
     env = os.environ.copy()
     env['DEPLOY_RELEASE_DIR'] = str(target)
     env['DEPLOY_PROJECT_ROOT'] = project['deploy_root']
-    if not runtimes.restart(project, target):
+    if not runtimes.restart(project, target, pull=pull):
         command = project['start_command']
         # An app's own updater (e.g. systemctl start qiyu-updater) can build for several minutes.
         _run(['cmd', '/c', command] if os.name == 'nt' else ['sh', '-c', command], cwd=target, env=env, timeout=1800, job=job)
@@ -214,8 +214,10 @@ def _external(job, project, action):
             _note(job,'执行构建')
             cmd = project['build_command']
             _run(['cmd','/c',cmd] if os.name=='nt' else ['sh','-c',cmd],cwd=root,timeout=1800,job=job)
-        _note(job,'重启服务并检查状态')
-        _start(project,root,job)
+        image_app = project.get('runtime') == 'compose'
+        _note(job,'拉取最新镜像，重启服务并检查状态' if image_app else '重启服务并检查状态')
+        # No code to fetch here: for a Compose app the newer image is the update.
+        _start(project,root,job,pull=image_app)
         _note(job,'更新与重启完成')
         status = 'succeeded'
     except Exception as exc:

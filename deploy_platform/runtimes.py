@@ -61,7 +61,7 @@ def validate_release(runtime, settings, repository):
     return {'project': name, 'files': files}
 
 
-def restart(project, target):
+def restart(project, target, pull=False):
     settings = json.loads(project.get('runtime_config') or '{}')
     runtime = project.get('runtime', 'command')
     if runtime == 'compose':
@@ -79,6 +79,10 @@ def restart(project, target):
                               compose_project_directory=str(target), compose_env_files=env_files)
         # Keep the original project name so volumes/network/container ownership stay stable.
         try:
+            if pull:
+                # Apps whose code is the image (sub2api): updating means getting the newer image.
+                # Services built from local source, or images that are not in a registry, are skipped.
+                client.compose.pull(ignore_pull_failures=True, quiet=True)
             client.compose.up(detach=True, build=True, force_recreate=True, wait=True, wait_timeout=90)
         except DockerException as exc:
             # Compose output is usually not captured; it goes to the platform's own service log.

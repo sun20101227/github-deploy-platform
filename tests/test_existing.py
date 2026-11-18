@@ -292,8 +292,8 @@ def test_non_git_apps_are_found_and_can_be_updated(setup,tmp_path):
     bare.create_remote('origin','https://github.com/sun20101227/qiyu-diary.git');bare.close()
     sub=tmp_path/'opt'/'sub2api';sub.mkdir();(sub/'docker-compose.yml').write_text('services: {}');(sub/'.env').write_text('SECRET=keep')
     inventory=[{'name':'sub2api','status':'running','project':'sub2api','path':str(sub),'files':[str(sub/'docker-compose.yml')],
-                'source':discovery.source_repository({'org.opencontainers.image.source':'https://github.com/Wei-Shaw/sub2api'})},
-               {'name':'sub2api-redis','status':'running','project':'sub2api','path':str(sub),'files':[str(sub/'docker-compose.yml')],'source':''},
+                'image':'weishaw/sub2api:latest','source':discovery.source_repository({'org.opencontainers.image.source':'https://github.com/Wei-Shaw/sub2api'})},
+               {'name':'sub2api-redis','status':'running','project':'sub2api','path':str(sub),'files':[str(sub/'docker-compose.yml')],'image':'redis:7','source':''},
                {'name':'openlist','status':'running','project':'','path':'','files':[''],'source':'OpenListTeam/OpenList'}]
     units=[{'unit':'qiyu-diary.service','path':str(diary/'current'/'.next'/'standalone'),'status':'active'},
            {'unit':'ubuntu-advantage.service','path':'/var/lib/ubuntu-advantage','status':'active'},
@@ -304,8 +304,9 @@ def test_non_git_apps_are_found_and_can_be_updated(setup,tmp_path):
     assert found['qiyu-diary']['kind']=='releases' and found['qiyu-diary']['repository']=='sun20101227/qiyu-diary'
     assert [u['unit'] for u in found['qiyu-diary']['services']]==['qiyu-diary.service']
     # No code in the directory, but the image says where its source lives.
-    assert found['sub2api']['kind']=='plain' and found['sub2api']['repository']=='Wei-Shaw/sub2api'
-    assert found['sub2api']['repository_from']=='image'
+    assert found['sub2api']['kind']=='image' and found['sub2api']['repository']=='Wei-Shaw/sub2api'
+    assert found['sub2api']['repository_from']=='image' and found['sub2api']['image']=='weishaw/sub2api:latest'
+    assert 'weishaw/sub2api:latest' in found['sub2api']['note']
     assert [c['name'] for c in found['sub2api']['containers']]==['sub2api','sub2api-redis']
     # Importing a non-Git directory needs the repository; it becomes an "external" project.
     payload={'path':str(sub),'account_id':1,'runtime':'compose','runtime_config':{'project':'sub2api','files':['docker-compose.yml']}}
@@ -327,11 +328,20 @@ def test_non_git_apps_are_found_and_can_be_updated(setup,tmp_path):
     with patch.object(deployer,'_start',start):
         deployer._execute(job,{},{**p,'build_command':''},'update')
     assert start.call_args.args[1]==sub
+    assert start.call_args.kwargs['pull'] is True   # the image is the code: updating pulls it
     assert (sub/'.env').read_text()=='SECRET=keep' and not (sub/'.git').exists()
     with db.connect() as c:
         row=c.execute('SELECT status,message FROM deployments WHERE id=?',(job,)).fetchone()
-    assert row['status']=='succeeded' and '更新与重启完成' in row['message']
+    assert row['status']=='succeeded' and '拉取最新镜像' in row['message'] and '更新与重启完成' in row['message']
     assert client.post(f"/api/projects/{p['id']}/rollback").status_code==409
+    # Compose pulls before up when asked, and a plain restart does not pull.
+    with patch.object(runtimes,'DockerClient') as docker:
+        runtimes.restart(p,sub,pull=True)
+        docker.return_value.compose.pull.assert_called_once_with(ignore_pull_failures=True,quiet=True)
+        docker.return_value.compose.up.assert_called_once()
+    with patch.object(runtimes,'DockerClient') as docker:
+        runtimes.restart(p,sub)
+        docker.return_value.compose.pull.assert_not_called()
 
 
 def test_logged_in_gh_is_connected_without_a_click(setup):

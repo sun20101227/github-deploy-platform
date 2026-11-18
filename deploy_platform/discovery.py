@@ -54,6 +54,7 @@ def containers():
                            'project': labels.get('com.docker.compose.project', ''),
                            'path': labels.get('com.docker.compose.project.working_dir', ''),
                            'files': labels.get('com.docker.compose.project.config_files', '').split(','),
+                           'image': (container.attrs.get('Config') or {}).get('Image', ''),
                            # Images built in CI usually say where their code lives (OCI label).
                            'source': source_repository(labels)})
         return result, ''
@@ -218,12 +219,20 @@ def _attach(item, inventory, units):
     item['containers'] = [c for c in inventory if _under(c['path'], root)]
     item['services'] = [u for u in units if _under(u['path'], root)]
     item.setdefault('repository_from', 'directory' if item['repository'] else '')
-    if not item['repository']:
-        sources = [c.get('source') for c in item['containers'] if c.get('source')]
-        if sources:
-            # Most common source among the app's containers (the app image, not postgres or redis).
-            item['repository'] = max(set(sources), key=sources.count)
-            item['repository_from'] = 'image'
+    item['image'] = ''
+    sourced = [c for c in item['containers'] if c.get('source')]
+    if sourced:
+        # The app's own image is the one that names a source repository (postgres or redis usually don't).
+        app = max(sourced, key=lambda c: sum(x.get('source') == c['source'] for x in sourced))
+        item['image'] = app.get('image', '')
+        if not item['repository']:
+            item['repository'], item['repository_from'] = app['source'], 'image'
+    if item['kind'] == 'plain' and item['containers'] and not item['path'].startswith('/opt/1panel'):
+        # No code here: the code ships inside the image, the directory only holds Compose config and data.
+        item['kind'] = 'image'
+        image = item['image'] or item['containers'][0].get('image', '')
+        item['note'] = (f'代码不在这个目录里，打包在 Docker 镜像 {image} 中' if image else '代码打包在 Docker 镜像中') + \
+                       '；目录里只有 Compose 配置和数据。接入后点“更新”会拉取最新镜像并重启。'
     return item
 
 

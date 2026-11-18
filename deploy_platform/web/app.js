@@ -64,7 +64,7 @@ const skeleton = () => '<div aria-hidden="true"><span class="sk sk-title"></span
 async function copy(text){try{await navigator.clipboard.writeText(text);toast('已复制')}catch{toast('复制失败，请手动选中文字')}}
 
 /* ---- 部署步骤：从任务记录里平台写下的步骤行推算进度 ---- */
-const STEP_LINES = ['拉取代码','拉取远端提交','准备回滚版本','执行构建','切换版本，启动服务','重启服务并检查状态'];
+const STEP_LINES = ['拉取代码','拉取远端提交','准备回滚版本','执行构建','切换版本，启动服务','重启服务并检查状态','拉取最新镜像，重启服务并检查状态'];
 const OK_LINES = /^(健康检查通过|服务已重启|更新与重启完成|已恢复|已清理|已登记)/;
 const BAD_LINES = /失败|未通过|中断|无法|超过|不符合|已改变|已分叉|请先|不存在/;
 function stepsFor(project, job){
@@ -72,7 +72,9 @@ function stepsFor(project, job){
   // A project that is not a Git checkout has no fetch step: the platform only builds and restarts.
   const names = project.mode==='external' || job.action==='restart' ? [] : [job.action==='rollback' ? '准备旧版本' : '拉取代码'];
   if(project.build_command && job.action!=='restart') names.push('构建');
-  names.push(project.healthcheck_url ? '重启并检查健康' : '重启服务');
+  // Pulling and restarting are one Compose step, so they share one item.
+  const pulls = project.mode==='external' && project.runtime==='compose' && job.action!=='restart';
+  names.push((pulls ? '拉取镜像并' : '') + (project.healthcheck_url ? '重启并检查健康' : '重启服务'));
   const msg = job.message || '';
   let reached = job.status==='queued' ? -1 : 0;
   if(/执行构建/.test(msg) && project.build_command) reached = names.indexOf('构建');
@@ -232,7 +234,8 @@ async function projectPage(id,tab,t){
   // 先确认、再进入加载状态：等人决定的时候按钮不该转圈
   $('#deploy').onclick = async e=>{
     const btn = e.currentTarget;
-    const copyText = external ? '这个目录不是 Git 仓库：将执行构建命令和重启（或项目自己的更新命令），然后检查服务状态。'
+    const copyText = external && p.runtime==='compose' ? '代码在 Docker 镜像里：将拉取最新镜像并重建容器，然后检查服务状态。服务会短暂中断。'
+      : external ? '这个目录不是 Git 仓库：将执行构建命令和重启（或项目自己的更新命令），然后检查服务状态。'
       : existing ? `将在原目录拉取 ${p.branch} 分支并快进合并，构建后重启服务。` : `将拉取 ${p.branch} 分支到新版本目录，构建完成后切换版本并重启服务。`;
     if(!await confirmAction(action, copyText, action)) return;
     busy(btn,async()=>{

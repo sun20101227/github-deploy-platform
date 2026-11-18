@@ -36,12 +36,12 @@ async function discoveryPage(t) {
   $('#content').innerHTML=header('已有项目','读取这台服务器上正在运行的服务和它们的仓库。')+`
     <form id="scan-form" class="scan-form"><label>扫描其他目录<input id="scan-root" required placeholder="例如 /opt 或 /srv/apps"></label><button class="primary">扫描目录</button></form>
     <p id="error" class="error" role="alert"></p><div id="scan-results"><p class="loading" role="status">正在读取运行中的服务…</p></div>`;
-  const KIND = {git:'Git 仓库', releases:'版本目录', plain:'普通目录'};
+  const KIND = {git:'Git 仓库', releases:'版本目录', image:'Docker 镜像', plain:'普通目录'};
   // Your own repositories, to match apps by name when the directory itself says nothing (e.g. qiyu-diary).
   let repoList = [], rerender = null;
   if(accounts.length) api(`/api/accounts/${accounts[0].id}/repositories`).then(rs=>{ repoList = rs; if(t===epoch && rerender) rerender() }).catch(()=>{});
   function repoText(p){
-    if(p.repository) return esc(p.repository)+(p.branch?' · '+esc(p.branch):'')+(p.repository_from==='image'?' <span class="muted">（镜像标注的源码仓库）</span>':'');
+    if(p.repository) return (p.repository_from==='image'?'GitHub 项目 ':'')+esc(p.repository)+(p.branch?' · '+esc(p.branch):'')+(p.repository_from==='image'?` <span class="muted">（从镜像 ${esc(p.image||'')} 读取${repoList.some(r=>r.full_name===p.repository)?'':'，不是你账号下的仓库'}）</span>`:'');
     const m = matchRepo(p, repoList);
     if(m) return `${esc(m.full_name)} · ${esc(m.default_branch)} <span class="muted">（按名称匹配${m.private?'，私有仓库':''}）</span>`;
     return '未关联 GitHub 仓库';
@@ -99,7 +99,8 @@ function importForm(p,accounts,back) {
   const settings={project:container?.project,files:container?.files||p.compose_files,unit:service?.unit};
   $('#scan-results').innerHTML=`<section class="section"><button class="text" id="back-results">← 扫描结果</button><h2>接入 ${esc(p.name)}</h2><p class="muted repo-path">${esc(p.path)}</p>
     ${p.dirty?'<p class="notice">可以先接入查看。更新前需要处理本地修改。</p>':''}
-    ${git?'':`<p class="notice">${esc(p.note||'不是 Git 仓库。')} 更新时平台不拉代码、不改文件，只执行下面的构建命令和重启方式，然后做健康检查；不能回滚。</p>`}
+    ${git?'':p.kind==='image'?`<p class="notice">${esc(p.note)} 平台不改动目录里的文件；用 Docker Compose 方式接入时，更新会先拉取最新镜像再重启，然后做健康检查。不能回滚到旧镜像。</p>`
+      :`<p class="notice">${esc(p.note||'不是 Git 仓库。')} 更新时平台不拉代码、不改文件，只执行下面的构建命令和重启方式，然后做健康检查；不能回滚。</p>`}
     ${accounts.length?`<form id="import-form" class="form"><label>GitHub 账号<select name="account_id">${accounts.map(a=>`<option value="${a.id}">${esc(a.login)}</option>`).join('')}</select></label>
       ${git?'':`<div class="pair"><label>对应的 GitHub 仓库<input name="repository" list="repo-list" required value="${esc(p.repository)}" placeholder="正在读取仓库…" pattern="[A-Za-z0-9_.\\-]+/[A-Za-z0-9_.\\-]+" autocomplete="off"><datalist id="repo-list"></datalist><small>格式 owner/repo，可以从列表里选。用来检查更新和接收推送；推送后自动执行下面的更新。</small></label><label>分支<input name="branch" required value="${esc(p.branch||'main')}"></label></div>`}
       ${runtimeFields(runtime,settings)}
