@@ -44,6 +44,19 @@ def test_management_auth_and_assets(client):
     assert client.get('/auth/github/callback?code=x&state=y',headers={'Authorization':''}).status_code==404
 
 
+def test_scripts_are_versioned_so_old_ones_are_never_served(client):
+    import re
+    page = client.get('/')
+    assert page.headers['cache-control'] == 'no-store'
+    urls = re.findall(r'"(/(?:app|discovery)\.js\?v=[0-9a-f]{12}|/style\.css\?v=[0-9a-f]{12})"', page.text)
+    assert len(urls) == 3
+    for url in urls:
+        r = client.get(url)
+        assert r.status_code == 200 and 'immutable' in r.headers['cache-control']
+    assert client.get('/app.js').headers['cache-control'] == 'no-cache'
+    assert 'cache-control' not in client.get('/health').headers
+
+
 def test_cli_connect_never_stores_token(client):
     with patch.object(api.cli_auth,'identity',return_value={'github_id':'9','login':'cli-user'}):
         assert client.post('/api/github/connect').status_code==200

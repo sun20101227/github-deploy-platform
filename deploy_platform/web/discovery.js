@@ -37,12 +37,22 @@ async function discoveryPage(t) {
     <form id="scan-form" class="scan-form"><label>扫描其他目录<input id="scan-root" required placeholder="例如 /opt 或 /srv/apps"></label><button class="primary">扫描目录</button></form>
     <p id="error" class="error" role="alert"></p><div id="scan-results"><p class="loading" role="status">正在读取运行中的服务…</p></div>`;
   const KIND = {git:'Git 仓库', releases:'版本目录', plain:'普通目录'};
+  // Your own repositories, to match apps by name when the directory itself says nothing (e.g. qiyu-diary).
+  let repoList = [], rerender = null;
+  if(accounts.length) api(`/api/accounts/${accounts[0].id}/repositories`).then(rs=>{ repoList = rs; if(t===epoch && rerender) rerender() }).catch(()=>{});
+  function repoText(p){
+    if(p.repository) return esc(p.repository)+(p.branch?' · '+esc(p.branch):'')+(p.repository_from==='image'?' <span class="muted">（镜像标注的源码仓库）</span>':'');
+    const m = matchRepo(p, repoList);
+    if(m) return `${esc(m.full_name)} · ${esc(m.default_branch)} <span class="muted">（按名称匹配${m.private?'，私有仓库':''}）</span>`;
+    return '未关联 GitHub 仓库';
+  }
   function show(result,title,emptyText) {
     function render() {
+      rerender = ()=>{ if(document.querySelector('.discovery-row')) render() };
       $('#scan-results').innerHTML=result.warnings.map(w=>`<p class="notice">${esc(w)}</p>`).join('')+
         `<section class="section"><h2>${esc(title(result.projects.length))}</h2><div class="sheet">${result.projects.map((p,i)=>`
           <div class="discovery-row" style="--i:${i}"><div><strong>${esc(p.name)}<span class="kind">${KIND[p.kind]||'目录'}</span></strong><small class="repo-path">${esc(p.path)}</small>
-            <small>${p.repository?esc(p.repository)+(p.branch?' · '+esc(p.branch):''):'未关联 GitHub 仓库'}${p.dirty?' · 有本地修改':''}</small>${p.note?`<small class="note">${esc(p.note)}</small>`:''}</div>
+            <small>${repoText(p)}${p.dirty?' · 有本地修改':''}</small>${p.note?`<small class="note">${esc(p.note)}</small>`:''}</div>
           <div class="runtime-hint">${p.containers.length?`Compose · ${p.containers.length} 个容器`:p.services.length?esc(p.services.map(s=>s.unit).join('、')):'没有找到运行中的服务'}</div>
           <button class="pick-project" data-index="${i}" ${p.imported?'disabled':''}>${p.imported?'已接入':'接入'}</button></div>`).join('')||`<p class="empty">${esc(emptyText)}</p>`}</div></section>
         <details class="container-list"><summary>Docker 容器 · ${result.containers.length}</summary>${result.containers.map(c=>`<p><strong>${esc(c.name)}</strong> · ${esc(c.status)}${c.project?` · Compose 项目 ${esc(c.project)}`:''}<br><small>${esc(c.path||'不是用 Compose 启动的，没有项目目录')}</small></p>`).join('')||'<p class="muted">没有可读取的容器。</p>'}</details>`;
@@ -70,6 +80,16 @@ async function discoveryPage(t) {
   }
 }
 
+// Same name as the app folder, its Compose project or its systemd unit.
+function guessesFor(p){
+  const container=p.containers.find(c=>c.project), service=p.services[0];
+  return [p.name,container?.project,service?.unit?.replace(/\.service$/,'')].filter(Boolean).map(s=>s.toLowerCase());
+}
+function matchRepo(p,repos){
+  const guesses=guessesFor(p);
+  return repos.find(r=>r.full_name===p.repository)||repos.find(r=>guesses.includes(r.full_name.split('/')[1].toLowerCase()));
+}
+
 function importForm(p,accounts,back) {
   const container=p.containers.find(c=>c.project&&c.files.length&&c.files[0]);
   const service=p.services[0];
@@ -77,7 +97,6 @@ function importForm(p,accounts,back) {
   // A release layout usually has its own updater: let it do the update, as a command.
   const runtime=p.kind==='releases'?'command':container?'compose':service?'systemd':'command';
   const settings={project:container?.project,files:container?.files||p.compose_files,unit:service?.unit};
-  const guesses=[p.name,container?.project,service?.unit?.replace(/\.service$/,'')].filter(Boolean).map(s=>s.toLowerCase());
   $('#scan-results').innerHTML=`<section class="section"><button class="text" id="back-results">← 扫描结果</button><h2>接入 ${esc(p.name)}</h2><p class="muted repo-path">${esc(p.path)}</p>
     ${p.dirty?'<p class="notice">可以先接入查看。更新前需要处理本地修改。</p>':''}
     ${git?'':`<p class="notice">${esc(p.note||'不是 Git 仓库。')} 更新时平台不拉代码、不改文件，只执行下面的构建命令和重启方式，然后做健康检查；不能回滚。</p>`}
@@ -105,7 +124,7 @@ function importForm(p,accounts,back) {
       $('#repo-list').innerHTML=rs.map(r=>`<option value="${esc(r.full_name)}">${r.private?'私有':'公开'} · 默认分支 ${esc(r.default_branch)}</option>`).join('');
       input.placeholder='owner/repo';
       // Prefill the repository found in the directory, else one whose name matches the app.
-      const pick=rs.find(r=>r.full_name===p.repository)||rs.find(r=>guesses.includes(r.full_name.split('/')[1].toLowerCase()));
+      const pick=matchRepo(p,rs);
       if(!input.value&&pick)input.value=pick.full_name;
       if(pick&&!p.branch)form.branch.value=pick.default_branch;
       input.onchange=()=>{const r=rs.find(r=>r.full_name===input.value.trim());if(r)form.branch.value=r.default_branch};

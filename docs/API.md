@@ -73,15 +73,16 @@
 
 ### 2.1 认证
 
-`/api/` 开头的接口都要带管理密钥：
+脚本和 CI 调用 `/api/` 开头的接口时，带上管理密钥：
 
 ```http
 Authorization: Bearer <DEPLOY_ADMIN_TOKEN>
 ```
 
 - 密钥错误或缺失时返回 `401`。
-- 服务器没有设置 `DEPLOY_ADMIN_TOKEN` 时，只接受本机直连的请求（不经过反向代理），其余一律 `401`。
+- 服务器没有设置 `DEPLOY_ADMIN_TOKEN` 时，脚本无法调用接口，只有登录后的控制台能用。
 - `/health` 和 `/webhooks/github/<项目 ID>` 不需要管理密钥。Webhook 用签名认证，见 [2.6](#26-webhook)。
+- 网页控制台用管理员账户登录，靠会话 Cookie 认证，见 [README 的“登录”](../README.md#登录)。用 Cookie 认证的改动类请求（POST、PUT）还必须带 `X-Deploy-Request: 1` 头，否则返回 `403`。用 Bearer 密钥的脚本不需要这个头。
 
 管理密钥能做所有操作，包括读取各项目的 Webhook Secret。只把它放在 CI 的加密变量（Secrets）里，不要写进代码或日志。
 
@@ -95,7 +96,8 @@ Authorization: Bearer <DEPLOY_ADMIN_TOKEN>
 |---|---|
 | 200 | 成功 |
 | 400 | 请求内容不对，例如缺少重启命令、目录不存在 |
-| 401 | 管理密钥错误，或 Webhook 签名无效 |
+| 401 | 管理密钥错误、未登录，或 Webhook 签名无效 |
+| 403 | 用 Cookie 登录的改动类请求缺少 `X-Deploy-Request` 头 |
 | 404 | 项目或账号不存在 |
 | 409 | 当前状态不允许，例如已有部署在进行、平台正在更新、没有可回滚的版本、gh 未登录 |
 | 422 | 字段格式不对，例如分支名或仓库名不合法 |

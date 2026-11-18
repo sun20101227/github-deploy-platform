@@ -61,6 +61,20 @@ def init() -> None:
                 started_at TEXT NOT NULL,
                 finished_at TEXT NOT NULL DEFAULT ''
             );
+            -- Console sign-in (auth.py). Sessions are stored as SHA-256 of the cookie value.
+            CREATE TABLE IF NOT EXISTS admins (
+                id INTEGER PRIMARY KEY,
+                username TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                password_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS admin_sessions (
+                token_hash TEXT PRIMARY KEY,
+                admin_id INTEGER NOT NULL REFERENCES admins(id) ON DELETE CASCADE,
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL
+            );
             """
         )
         # Keep development databases created by the first scaffold usable.

@@ -18,6 +18,14 @@ def repository_name(url):
     return match[1] if match else ''
 
 
+def source_repository(labels):
+    for key in ('org.opencontainers.image.source', 'org.opencontainers.image.url'):
+        name = repository_name((labels or {}).get(key, '').strip())
+        if name:
+            return name
+    return ''
+
+
 def inspect(path):
     root = Path(path).resolve(strict=True)
     if root == config.ROOT.resolve():
@@ -45,7 +53,9 @@ def containers():
             result.append({'name': container.name, 'status': container.status,
                            'project': labels.get('com.docker.compose.project', ''),
                            'path': labels.get('com.docker.compose.project.working_dir', ''),
-                           'files': labels.get('com.docker.compose.project.config_files', '').split(',')})
+                           'files': labels.get('com.docker.compose.project.config_files', '').split(','),
+                           # Images built in CI usually say where their code lives (OCI label).
+                           'source': source_repository(labels)})
         return result, ''
     except Exception:
         return [], 'Docker 未运行或当前用户无访问权限'
@@ -207,6 +217,13 @@ def _attach(item, inventory, units):
     root = item['path']
     item['containers'] = [c for c in inventory if _under(c['path'], root)]
     item['services'] = [u for u in units if _under(u['path'], root)]
+    item.setdefault('repository_from', 'directory' if item['repository'] else '')
+    if not item['repository']:
+        sources = [c.get('source') for c in item['containers'] if c.get('source')]
+        if sources:
+            # Most common source among the app's containers (the app image, not postgres or redis).
+            item['repository'] = max(set(sources), key=sources.count)
+            item['repository_from'] = 'image'
     return item
 
 

@@ -33,10 +33,11 @@ function sha(repo, value, n=8){
 }
 function toast(text){const t=$('#toast');t.hidden=true;t.textContent=text;void t.offsetWidth;t.hidden=false;clearTimeout(toast.timer);toast.timer=setTimeout(()=>t.hidden=true,4000)}
 async function api(path, data, method){
-  const r = await fetch(path,{method:method || (data===undefined?'GET':'POST'),headers:{'Content-Type':'application/json','Authorization':'Bearer '+(sessionStorage.getItem('admin')||'')},body:data===undefined?undefined:JSON.stringify(data)});
+  // 登录状态在 HttpOnly 的会话 Cookie 里，脚本读不到；改动类请求带上 X-Deploy-Request，别的网站伪造不了这个头
+  const r = await fetch(path,{method:method || (data===undefined?'GET':'POST'),credentials:'same-origin',headers:{'Content-Type':'application/json','X-Deploy-Request':'1'},body:data===undefined?undefined:JSON.stringify(data)});
   let d = {};
   try { d = await r.json() } catch { /* 网关错误页不是 JSON */ }
-  if(r.status===401){location.hash='/login';throw Error('请先解锁控制台')}
+  if(r.status===401 && !path.startsWith('/api/auth/')){ me = null; showUser(); location.hash='/login'; throw Error('请先登录') }
   if(!r.ok) throw Error(typeof d.detail==='string' ? d.detail : `请求失败（${r.status}），请检查输入或服务器日志`);
   return d;
 }
@@ -282,9 +283,66 @@ async function waitForRestart(instance){
   if(epoch===t) $('#self-result').textContent = '还没确认服务恢复，请检查服务器日志。';
 }
 
-function loginPage(){
-  $('#content').innerHTML = header('解锁控制台','输入服务器上设置的管理密钥。') + '<form id="login" class="form card narrow"><label>管理密钥<input type="password" name="token" required autocomplete="current-password" autofocus><small>服务器的 DEPLOY_ADMIN_TOKEN，只保存在这个浏览器标签页里。</small></label><p id="error" class="error" role="alert"></p><button class="primary">进入</button></form>';
-  $('#login').onsubmit = e=>{ e.preventDefault(); sessionStorage.setItem('admin',new FormData(e.target).get('token')); busy(e.submitter,async()=>{ await api('/api/accounts'); location.hash='/projects' }) };
+/* ---- 登录、首次创建管理员、账户 ---- */
+let me = null;   // 当前登录的管理员用户名；没登录时为 null
+function showUser(){
+  $('#who').textContent = me || '未登录';
+  $('#lock').hidden = !me;
+}
+async function loginPage(t){
+  const s = await api('/api/auth/state'); if(t!==epoch) return;
+  if(s.logged_in){ me = s.username; showUser(); location.hash = '/projects'; return }
+  if(!s.admin_exists){
+    $('#content').innerHTML = header('创建管理员账户','第一次使用，先创建登录控制台用的账户。') + (s.setup_allowed
+      ? `<form id="setup" class="form card narrow">${s.setup_needs_token?'<label>管理密钥<input type="password" name="token" required autocomplete="off"><small>服务器 .env 里的 DEPLOY_ADMIN_TOKEN，用来确认是你在操作。只需要这一次。</small></label>':''}
+          <label>用户名<input name="username" required minlength="3" maxlength="32" pattern="[A-Za-z0-9_.\\-]+" autocomplete="username" value="admin"><small>英文字母、数字、点、横线和下划线，3–32 个字符。</small></label>
+          <label>密码<input type="password" name="password" required minlength="10" maxlength="128" autocomplete="new-password"><small>至少 10 个字符。</small></label>
+          <label>再输一次密码<input type="password" name="confirm" required autocomplete="new-password"></label>
+          <p id="error" class="error" role="alert"></p><button class="primary">创建并登录</button></form>`
+      : `<div class="card narrow"><p>服务器没有设置 DEPLOY_ADMIN_TOKEN，只能在服务器上创建管理员：</p><div class="command"><code>python -m deploy_platform admin admin</code></div><p>在平台目录下用它的 Python 运行，按提示输入密码，然后刷新这个页面。</p></div>`);
+    const f = $('#setup');
+    if(f) f.onsubmit = e=>{ e.preventDefault(); busy(e.submitter,async()=>{
+      const d = Object.fromEntries(new FormData(f));
+      if(d.password!==d.confirm) throw Error('两次输入的密码不一样');
+      const r = await api('/api/auth/setup',{username:d.username,password:d.password,token:d.token||''});
+      me = r.username; showUser(); toast('管理员账户已创建'); location.hash = '/projects';
+    }) };
+    return;
+  }
+  $('#content').innerHTML = header('登录','用管理员账户登录控制台。') + `<form id="login" class="form card narrow">
+    <label>用户名<input name="username" required autocomplete="username" autofocus></label>
+    <label>密码<input type="password" name="password" required autocomplete="current-password"></label>
+    <p id="error" class="error" role="alert"></p><button class="primary">登录</button>
+    <p class="settings-note">忘记密码时，在服务器上运行 <code>python -m deploy_platform admin 用户名</code> 重新设置。</p></form>`;
+  $('#login').onsubmit = e=>{ e.preventDefault(); busy(e.submitter,async()=>{
+    const d = Object.fromEntries(new FormData(e.target));
+    const r = await api('/api/auth/login',{username:d.username,password:d.password});
+    me = r.username; showUser(); location.hash = '/projects';
+  }) };
+}
+async function accountPage(t){
+  const s = await api('/api/auth/state'); if(t!==epoch) return;
+  $('#content').innerHTML = header('账户', s.logged_in ? `已登录为 ${s.username}` : '') + `<div class="narrow">
+    ${s.logged_in ? `<form id="password" class="form card"><h2>修改密码</h2>
+      <label>当前密码<input type="password" name="current" required autocomplete="current-password"></label>
+      <label>新密码<input type="password" name="new" required minlength="10" maxlength="128" autocomplete="new-password"><small>至少 10 个字符。改完后其他设备上的登录会失效。</small></label>
+      <label>再输一次新密码<input type="password" name="confirm" required autocomplete="new-password"></label>
+      <p id="error" class="error" role="alert"></p><div class="buttons"><button class="primary">修改密码</button><button type="button" id="logout">退出登录</button></div></form>` : ''}
+    <section class="card"><h2>脚本和 CI 怎么访问</h2><p>控制台用账户登录。脚本、CI 调用接口时仍然用服务器 .env 里的 DEPLOY_ADMIN_TOKEN，放在 <code>Authorization: Bearer</code> 头里，见接入文档。没有设置这个变量时，只有登录后的控制台能调用接口。</p></section></div>`;
+  const f = $('#password');
+  if(f){
+    f.onsubmit = e=>{ e.preventDefault(); busy(e.submitter,async()=>{
+      const d = Object.fromEntries(new FormData(f));
+      if(d.new!==d.confirm) throw Error('两次输入的新密码不一样');
+      await api('/api/auth/password',{current:d.current,new:d.new});
+      f.reset(); toast('密码已修改，其他设备需要重新登录');
+    }) };
+    $('#logout').onclick = logout;
+  }
+}
+async function logout(){
+  try { await api('/api/auth/logout',{}) } catch {}
+  me = null; showUser(); location.hash = '/login';
 }
 
 /* ---- 路由：换页时显示骨架、播一次进场；轮询刷新不重播 ---- */
@@ -292,7 +350,13 @@ async function route(){
   clearTimeout(poll); const t = ++epoch;
   const parts = location.hash.replace(/^#\/?/,'').split('/');
   const page = parts[0] || 'projects';
-  const name = {projects:'项目',project:'项目',new:'新建项目',github:'GitHub',platform:'平台更新',login:'解锁控制台',discovery:'已有项目'}[page] || '项目';
+  const name = {projects:'项目',project:'项目',new:'新建项目',github:'GitHub',platform:'平台更新',login:'登录',discovery:'已有项目',account:'账户'}[page] || '项目';
+  if(me===null && page!=='login'){
+    // 第一次打开：问一下有没有登录，用来显示侧栏的用户名；没登录就去登录页
+    try { const s = await api('/api/auth/state'); me = s.logged_in ? s.username : null } catch {}
+    showUser();
+    if(!me && t===epoch){ location.hash = '/login'; return }
+  }
   document.title = name + ' · Deploy'; $('#crumb').textContent = name;
   document.querySelectorAll('[data-nav]').forEach(a=>{ if(a.dataset.nav===(['project','new'].includes(page)?'projects':page)) a.setAttribute('aria-current','page'); else a.removeAttribute('aria-current') });
   const content = $('#content');
@@ -303,12 +367,13 @@ async function route(){
     else if(page==='new') await newPage(t);
     else if(page==='project') await projectPage(Number(parts[1]),parts[2]||'overview',t);
     else if(page==='platform') await platformPage(t);
-    else if(page==='login') loginPage();
+    else if(page==='login') await loginPage(t);
+    else if(page==='account') await accountPage(t);
     else await projectsPage(t);
   } catch(e) {
     if(t===epoch){ content.innerHTML = header(name) + `<p class="error" role="alert">${esc(e.message)}</p><button id="retry">重试</button>`; $('#retry').onclick = route }
   }
   if(t===epoch){ content.classList.add('enter'); setTimeout(()=>{ if(t===epoch) content.classList.remove('enter') }, 450) }
 }
-$('#lock').onclick = ()=>{ sessionStorage.removeItem('admin'); location.hash='/login' };
+$('#lock').onclick = logout;
 window.addEventListener('hashchange',route); route();

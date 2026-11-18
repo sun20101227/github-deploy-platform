@@ -291,8 +291,10 @@ def test_non_git_apps_are_found_and_can_be_updated(setup,tmp_path):
     bare=Repo.init(diary/'repo.git',bare=True,initial_branch='main')
     bare.create_remote('origin','https://github.com/sun20101227/qiyu-diary.git');bare.close()
     sub=tmp_path/'opt'/'sub2api';sub.mkdir();(sub/'docker-compose.yml').write_text('services: {}');(sub/'.env').write_text('SECRET=keep')
-    inventory=[{'name':'sub2api','status':'running','project':'sub2api','path':str(sub),'files':[str(sub/'docker-compose.yml')]},
-               {'name':'openlist','status':'running','project':'','path':'','files':['']}]
+    inventory=[{'name':'sub2api','status':'running','project':'sub2api','path':str(sub),'files':[str(sub/'docker-compose.yml')],
+                'source':discovery.source_repository({'org.opencontainers.image.source':'https://github.com/Wei-Shaw/sub2api'})},
+               {'name':'sub2api-redis','status':'running','project':'sub2api','path':str(sub),'files':[str(sub/'docker-compose.yml')],'source':''},
+               {'name':'openlist','status':'running','project':'','path':'','files':[''],'source':'OpenListTeam/OpenList'}]
     units=[{'unit':'qiyu-diary.service','path':str(diary/'current'/'.next'/'standalone'),'status':'active'},
            {'unit':'ubuntu-advantage.service','path':'/var/lib/ubuntu-advantage','status':'active'},
            {'unit':'systemd-sysusers.service','path':'!/root','status':'inactive'}]
@@ -301,8 +303,10 @@ def test_non_git_apps_are_found_and_can_be_updated(setup,tmp_path):
     assert set(found)=={'qiyu-diary','sub2api'}
     assert found['qiyu-diary']['kind']=='releases' and found['qiyu-diary']['repository']=='sun20101227/qiyu-diary'
     assert [u['unit'] for u in found['qiyu-diary']['services']]==['qiyu-diary.service']
-    assert found['sub2api']['kind']=='plain' and found['sub2api']['repository']==''
-    assert [c['name'] for c in found['sub2api']['containers']]==['sub2api']
+    # No code in the directory, but the image says where its source lives.
+    assert found['sub2api']['kind']=='plain' and found['sub2api']['repository']=='Wei-Shaw/sub2api'
+    assert found['sub2api']['repository_from']=='image'
+    assert [c['name'] for c in found['sub2api']['containers']]==['sub2api','sub2api-redis']
     # Importing a non-Git directory needs the repository; it becomes an "external" project.
     payload={'path':str(sub),'account_id':1,'runtime':'compose','runtime_config':{'project':'sub2api','files':['docker-compose.yml']}}
     assert client.post('/api/projects/import',json=payload).status_code==400

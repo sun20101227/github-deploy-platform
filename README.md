@@ -12,13 +12,23 @@ git clone https://github.com/sun20101227/github-deploy-platform.git
 cd github-deploy-platform
 python3 -m venv .venv
 .venv/bin/pip install -e .
-export DEPLOY_ADMIN_TOKEN='替换成随机管理密钥'
+export DEPLOY_ADMIN_TOKEN='替换成随机管理密钥'   # 用于第一次创建管理员，以及脚本和 CI 调用接口
 .venv/bin/python -m deploy_platform
 ```
 
 Windows 使用 `.venv/Scripts/python -m deploy_platform`，环境变量用 PowerShell 的 `$env:DEPLOY_ADMIN_TOKEN` 设置。通过 `DEPLOY_HOST`、`DEPLOY_PORT` 调整监听地址和端口。配置通过环境变量读取；把 `.env.example` 复制为项目根目录的 `.env` 后会在启动时自动加载，已经设置的环境变量优先。Linux 常驻运行可参考 [systemd 配置](deploy/deploy-platform.service)，由 systemd 的 `EnvironmentFile` 加载环境变量。
 
-在 HTTPS 反向代理后使用，管理密钥在网页解锁时输入，仅存在当前浏览器会话。未设置密钥只允许本机直连开发访问；反向代理必须传递 `X-Forwarded-For`。当前使用单进程运行，不要设置多个 workers。
+在 HTTPS 反向代理后使用；反向代理必须传递 `X-Forwarded-For` 和 `X-Forwarded-Proto`。当前使用单进程运行，不要设置多个 workers。
+
+## 登录
+
+控制台用管理员账户（用户名 + 密码）登录：
+
+- **第一次打开**：页面会要求创建管理员账户，并输入一次服务器 `.env` 里的 `DEPLOY_ADMIN_TOKEN` 确认是你在操作。没有设置这个变量时，只能在服务器本机打开页面创建，或者用下面的命令创建。
+- **登录状态**：保存在 HttpOnly Cookie 里，7 天有效。在“账户”页可以修改密码，改完后其他设备上的登录会失效。
+- **防暴力破解**：同一来源连续输错 5 次，或同一用户名 15 分钟内被输错 20 次，会暂停登录 15 分钟。
+- **忘记密码**：在服务器的平台目录下运行 `.venv/bin/python -m deploy_platform admin <用户名>`，按提示输入新密码。这个账户之前的登录都会失效；用户名不存在时会新建这个账户。
+- **脚本和 CI**：仍然用 `DEPLOY_ADMIN_TOKEN` 作为 `Authorization: Bearer` 调用接口，见[接入文档](docs/API.md)。不需要脚本访问时，可以在创建管理员之后把这个变量删掉。
 
 ## 页面
 

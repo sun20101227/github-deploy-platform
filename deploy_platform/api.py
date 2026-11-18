@@ -5,7 +5,9 @@ import hmac
 import secrets
 import httpx
 
-from fastapi import FastAPI, HTTPException, Query, Request
+import os
+
+from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 from pathlib import Path
@@ -14,31 +16,139 @@ import re
 import uuid
 from typing import Literal
 
-from . import db, github, cli_auth, config
+from . import auth, db, github, cli_auth, config
 from .deployer import DeploymentError, deploy, rollback
 from . import self_update, discovery, runtimes, restart
 from . import deployer
 
 app = FastAPI(title="GitHub Deploy Platform", version="0.1.0")
 db.init()
+auth.init()
 db.recover_interrupted()
 INSTANCE = uuid.uuid4().hex
+
+# Reachable without signing in: what the login page needs.
+PUBLIC_API = {'/api/auth/state', '/api/auth/login', '/api/auth/setup'}
+
+
+def _local(request) -> bool:
+    """A direct request from this machine, not one passed on by the reverse proxy."""
+    return bool(request.client and request.client.host in ('127.0.0.1', '::1', 'testclient')
+                and not request.headers.get('x-forwarded-for'))
+
+
+def _api_token_ok(request) -> bool:
+    key = os.environ.get('DEPLOY_ADMIN_TOKEN', '')
+    header = request.headers.get('Authorization', '')
+    return bool(key) and header.startswith('Bearer ') and hmac.compare_digest(key, header.removeprefix('Bearer '))
 
 
 @app.middleware("http")
 async def admin_access(request, call_next):
-    import os
     from fastapi.responses import JSONResponse
-    if request.url.path.startswith('/api/'):
-        key = os.environ.get('DEPLOY_ADMIN_TOKEN', '')
-        provided = request.headers.get('Authorization', '').removeprefix('Bearer ')
-        if key:
-            allowed = hmac.compare_digest(key, provided)
+    path = request.url.path
+    if path.startswith('/api/') and path not in PUBLIC_API:
+        admin = auth.session_admin(request.cookies.get(auth.COOKIE))
+        if admin:
+            # A cookie rides along on any request to this site; a custom header cannot be added
+            # by another site's form or image, so changes must carry it.
+            if request.method not in ('GET', 'HEAD', 'OPTIONS') and request.headers.get('x-deploy-request') != '1':
+                return JSONResponse({'detail': '请求缺少 X-Deploy-Request 头'}, status_code=403)
+            request.state.admin = admin
+        elif _api_token_ok(request):
+            request.state.admin = None  # scripts and CI: DEPLOY_ADMIN_TOKEN as a Bearer token
+        elif not auth.admin_exists() and not os.environ.get('DEPLOY_ADMIN_TOKEN') and _local(request):
+            request.state.admin = None  # nothing configured yet: local development only
         else:
-            allowed = request.client and request.client.host in ('127.0.0.1', '::1', 'testclient') and not request.headers.get('x-forwarded-for')
-        if not allowed:
-            return JSONResponse({'detail': '请输入管理密钥；服务器需设置 DEPLOY_ADMIN_TOKEN'}, status_code=401)
+            return JSONResponse({'detail': '请先登录'}, status_code=401)
     return await call_next(request)
+
+
+class Credentials(BaseModel):
+    username: str
+    password: str
+
+
+class SetupRequest(Credentials):
+    token: str = ''
+
+
+class PasswordChange(BaseModel):
+    current: str
+    new: str
+
+
+def _set_session(response, request, admin_id):
+    response.set_cookie(auth.COOKIE, auth.create_session(admin_id), max_age=auth.SESSION_DAYS * 86400,
+                        httponly=True, samesite='strict', secure=request.url.scheme == 'https', path='/')
+
+
+@app.get('/api/auth/state')
+def auth_state(request: Request):
+    admin = auth.session_admin(request.cookies.get(auth.COOKIE))
+    exists = auth.admin_exists()
+    return {'admin_exists': exists, 'logged_in': bool(admin), 'username': admin['username'] if admin else '',
+            # The first admin is created with the old management key, or only from this machine when there is none.
+            'setup_needs_token': not exists and bool(os.environ.get('DEPLOY_ADMIN_TOKEN')),
+            'setup_allowed': not exists and (bool(os.environ.get('DEPLOY_ADMIN_TOKEN')) or _local(request))}
+
+
+@app.post('/api/auth/setup')
+def auth_setup(payload: SetupRequest, request: Request, response: Response):
+    if auth.admin_exists():
+        raise HTTPException(409, '管理员账户已经存在，请直接登录')
+    key = os.environ.get('DEPLOY_ADMIN_TOKEN', '')
+    client = request.client.host if request.client else ''
+    if key:
+        if wait := auth.throttle.wait_seconds(client, 'setup'):
+            raise HTTPException(429, f'尝试次数过多，请 {wait // 60 + 1} 分钟后再试')
+        if not hmac.compare_digest(key, payload.token):
+            auth.throttle.failed(client, 'setup')
+            raise HTTPException(401, '管理密钥不正确。它是服务器 .env 里的 DEPLOY_ADMIN_TOKEN')
+    elif not _local(request):
+        raise HTTPException(403, '服务器没有设置 DEPLOY_ADMIN_TOKEN，只能在服务器本机创建管理员，或运行 python -m deploy_platform admin <用户名>')
+    try:
+        admin_id = auth.set_admin(payload.username.strip(), payload.password)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from None
+    _set_session(response, request, admin_id)
+    return {'ok': True, 'username': payload.username.strip()}
+
+
+@app.post('/api/auth/login')
+def auth_login(payload: Credentials, request: Request, response: Response):
+    client = request.client.host if request.client else ''
+    username = payload.username.strip()
+    if wait := auth.throttle.wait_seconds(client, username):
+        raise HTTPException(429, f'尝试次数过多，请 {wait // 60 + 1} 分钟后再试')
+    admin = auth.authenticate(username, payload.password)
+    if not admin:
+        auth.throttle.failed(client, username)
+        raise HTTPException(401, '用户名或密码不正确')
+    auth.throttle.succeeded(client, username)
+    _set_session(response, request, admin['id'])
+    return {'ok': True, 'username': admin['username']}
+
+
+@app.post('/api/auth/logout')
+def auth_logout(request: Request, response: Response):
+    auth.end_session(request.cookies.get(auth.COOKIE))
+    response.delete_cookie(auth.COOKIE, path='/')
+    return {'ok': True}
+
+
+@app.post('/api/auth/password')
+def auth_password(payload: PasswordChange, request: Request):
+    admin = getattr(request.state, 'admin', None)
+    if not admin:
+        raise HTTPException(400, '请用管理员账户登录后再修改密码')
+    try:
+        auth.change_password(admin['id'], payload.current, payload.new, keep_token=request.cookies.get(auth.COOKIE))
+    except PermissionError as exc:
+        raise HTTPException(403, str(exc)) from None
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from None
+    return {'ok': True}
 
 
 
@@ -400,5 +510,37 @@ def edit_project(project_id: int, payload: ProjectCreate):
     return {"ok": True}
 
 
-app.mount("/", StaticFiles(directory=__import__("pathlib").Path(__file__).with_name("web"), html=True), name="web")
+WEB = Path(__file__).with_name("web")
+
+
+def _asset_version(name: str) -> str:
+    return hashlib.sha256((WEB / name).read_bytes()).hexdigest()[:12]
+
+
+# Script and style URLs carry a hash of their content: a new version is a new URL, so neither the
+# browser nor Cloudflare (which adds a 4 h browser cache to static files) can keep serving an old one.
+# Files only change by a self update, which restarts the process, so hashing once at start is enough.
+INDEX_HTML = (WEB / "index.html").read_text(encoding="utf-8")
+for _asset in ("style.css", "discovery.js", "app.js"):
+    INDEX_HTML = INDEX_HTML.replace(f'"/{_asset}"', f'"/{_asset}?v={_asset_version(_asset)}"')
+
+
+@app.get("/", include_in_schema=False)
+@app.get("/index.html", include_in_schema=False)
+def index():
+    from fastapi.responses import HTMLResponse
+    return HTMLResponse(INDEX_HTML, headers={"Cache-Control": "no-store"})
+
+
+@app.middleware("http")
+async def static_cache(request, call_next):
+    response = await call_next(request)
+    path = request.url.path
+    if not path.startswith(("/api/", "/webhooks/", "/health")) and "cache-control" not in response.headers:
+        # Versioned URLs never change; anything else is checked with the server every time.
+        response.headers["Cache-Control"] = "public, max-age=31536000, immutable" if request.query_params.get("v") else "no-cache"
+    return response
+
+
+app.mount("/", StaticFiles(directory=WEB, html=True), name="web")
 
