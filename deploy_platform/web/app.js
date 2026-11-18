@@ -115,6 +115,9 @@ async function serviceCard(p, id, active, t){
   let s;
   try { s = await api(`/api/projects/${id}/status`) } catch(e) { s = {state:'unknown', detail:e.message, items:[], health:null} }
   const card = $('#svc'); if(t!==epoch || !card) return;
+  // The commit the app runs right now (release REVISION or image label), which its own updater may have changed.
+  const cc = $('#current-commit');
+  if(s.commit && cc) cc.innerHTML = sha(p.repository, s.commit, 12) + ' <small>正在运行</small>';
   const canLogs = ['compose','systemd','container'].includes(p.runtime);
   card.innerHTML = `<h2>服务 ${svcBadge(s.state)}</h2>${s.detail?`<p class="state-line">${esc(s.detail)}</p>`:''}
     ${s.items.length?`<ul class="svc-list">${s.items.map(i=>`<li><span class="svc-dot ${i.state==='running'&&i.health!=='unhealthy'?'running':i.state==='running'?'degraded':'stopped'}"></span><strong>${esc(i.name)}</strong><span>${esc(STATE_NAMES[i.state]||i.state)}${i.health&&i.health!=='running'?' · '+esc(i.health==='healthy'?'健康':i.health==='unhealthy'?'不健康':i.health):''}${since(i.since)?` · ${i.state==='running'?'启动于':'停止于'} ${esc(since(i.since))}`:''}${i.restarts?` · 重启过 ${i.restarts} 次`:''}</span></li>`).join('')}</ul>`:''}
@@ -237,7 +240,8 @@ async function projectPage(id,tab,t){
   $('#deploy').onclick = async e=>{
     const btn = e.currentTarget;
     const copyText = external && p.runtime==='compose' ? '代码在 Docker 镜像里：将拉取最新镜像并重建容器，然后检查服务状态。服务会短暂中断。'
-      : external ? '这个目录不是 Git 仓库：将执行构建命令和重启（或项目自己的更新命令），然后检查服务状态。'
+      : external && p.runtime==='command' ? `将运行 ${p.start_command}：由项目自己的更新程序从 GitHub 拿 ${p.branch} 的最新版本并切换，完成后平台检查服务状态、记下正在运行的提交。`
+      : external ? '将执行构建命令并重启服务，然后检查服务状态。'
       : existing ? `将在原目录拉取 ${p.branch} 分支并快进合并，构建后重启服务。` : `将拉取 ${p.branch} 分支到新版本目录，构建完成后切换版本并重启服务。`;
     if(!await confirmAction(action, copyText, action)) return;
     busy(btn,async()=>{
@@ -253,14 +257,14 @@ async function projectPage(id,tab,t){
     body.innerHTML = `<div class="split"><div>
       ${active ? `<section class="card hero new"><h2>正在${actionNames[active.action]||'部署'} · #${active.id}</h2>${stepsFor(p,active)}<p class="state-line"><span class="spinner" aria-hidden="true"></span>已进行 ${took(active)}，完成后自动刷新。</p><a class="button" href="${root}/history">查看输出</a></section>` : ''}
       <section class="card" id="svc"><h2>服务</h2><p class="state-line"><span class="spinner" aria-hidden="true"></span>正在读取服务状态…</p></section>
-      <section class="card"><h2>当前版本</h2><dl class="kv"><dt>提交</dt><dd>${current ? sha(p.repository,current.commit_sha,12) : '<span class="muted">尚未部署</span>'}</dd><dt>分支</dt><dd>${esc(p.branch)}</dd><dt>部署时间</dt><dd>${current ? `${when(current.finished_at)} <small>· ${esc(stamp(current.finished_at))}</small>` : '—'}</dd><dt>最近任务</dt><dd>${badge(last?.status)}${last && last!==current ? ` <small>${when(last.started_at)}</small>` : ''}</dd></dl>
+      <section class="card"><h2>当前版本</h2><dl class="kv"><dt>提交</dt><dd id="current-commit">${current ? sha(p.repository,current.commit_sha,12) : '<span class="muted">尚未部署</span>'}</dd><dt>分支</dt><dd>${esc(p.branch)}</dd><dt>部署时间</dt><dd>${current ? `${when(current.finished_at)} <small>· ${esc(stamp(current.finished_at))}</small>` : '—'}</dd><dt>最近任务</dt><dd>${badge(last?.status)}${last && last!==current ? ` <small>${when(last.started_at)}</small>` : ''}</dd></dl>
         <div class="buttons"><button id="check">检查更新</button><button id="rollback" ${canRollback?'':'disabled'}>回滚上一版</button></div><div id="check-result" class="settings-note" role="status"></div></section>
-    </div><div class="card info"><h3>${existing?'原目录 · 已接入':external?'原目录 · 已接入（不是 Git 仓库）':'部署目录'}</h3><p class="mono">${esc(p.deploy_root)}</p><h3>重启方式</h3><p>${runtimeText(p)}</p><h3>健康检查</h3><p class="muted">${esc(p.healthcheck_url||'未配置')}${p.healthcheck_url?` <small>· 最长 ${esc(p.healthcheck_timeout||45)} 秒</small>`:''}</p></div></div>`;
+    </div><div class="card info"><h3>${existing?'原目录 · Git 仓库':external?'原目录 · 已接入':'部署目录'}</h3><p class="mono">${esc(p.deploy_root)}</p><h3>重启方式</h3><p>${runtimeText(p)}</p><h3>健康检查</h3><p class="muted">${esc(p.healthcheck_url||'未配置')}${p.healthcheck_url?` <small>· 最长 ${esc(p.healthcheck_timeout||45)} 秒</small>`:''}</p></div></div>`;
     $('#check').onclick = e=>busy(e.currentTarget,async()=>{
       const d = await api(`/api/projects/${id}/check`);
       // Not a Git checkout: the platform cannot tell which commit is running, so do not claim one.
       const unknown = external && !d.current_sha;
-      $('#check-result').innerHTML = `<div class="versions${d.available&&!unknown?' new':''}"><div><span>当前部署</span><strong>${esc(d.current_sha?.slice(0,7)||'—')}</strong>${unknown?'<small>由项目自己管理</small>':''}</div><span class="to" aria-hidden="true">${unknown?'·':d.available?'→':'='}</span><div><span>GitHub 上最新</span><strong>${esc(d.sha.slice(0,7))}</strong><small title="${esc(d.message)}">${esc(d.message)}</small></div></div><p class="state-line">${unknown?'这个目录不是 Git 仓库，看不出正在运行哪个提交；点“更新”会执行更新命令。':d.available?'有新提交可以部署。':'已经是最新版本。'}${d.date?` <small>${when(d.date)}提交</small>`:''}</p>`;
+      $('#check-result').innerHTML = `<div class="versions${d.available&&!unknown?' new':''}"><div><span>当前部署</span><strong>${esc(d.current_sha?.slice(0,7)||'—')}</strong>${unknown?'<small>由项目自己管理</small>':''}</div><span class="to" aria-hidden="true">${unknown?'·':d.available?'→':'='}</span><div><span>GitHub 上最新</span><strong>${esc(d.sha.slice(0,7))}</strong><small title="${esc(d.message)}">${esc(d.message)}</small></div></div><p class="state-line">${unknown?'看不出正在运行哪个提交（没有 REVISION 文件，镜像也没标注）；点“更新”会执行更新命令。':d.available?'有新提交可以部署。':'已经是最新版本。'}${d.date?` <small>${when(d.date)}提交</small>`:''}</p>`;
     });
     $('#rollback').onclick = async e=>{
       const btn = e.currentTarget;

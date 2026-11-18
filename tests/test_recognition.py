@@ -109,6 +109,45 @@ def test_the_whole_server_is_recognised(server):
     assert home['repository'] == ''
 
 
+def test_running_commit_of_release_layouts_and_images(server, tmp_path):
+    opt, _ = server
+    diary = opt/'qiyu-diary'
+    sha = 'fe99e0d6649b9b9a208a331efdb60e7b823b9a72'
+    # The updater writes REVISION into each release; current points at the running one.
+    (diary/'current'/'REVISION').write_text(sha + '\n')
+    assert discovery.release_commit(diary) == sha
+    assert discovery.describe(diary)['commit'] == sha
+    # Without REVISION, the hash at the end of the release folder name is used.
+    other = tmp_path/'app'; (other/'releases'/'20261118-003318-8edff91').mkdir(parents=True)
+    try:
+        (other/'current').symlink_to(other/'releases'/'20261118-003318-8edff91', target_is_directory=True)
+        assert discovery.release_commit(other) == '8edff91'
+    except OSError:
+        pass  # Windows without the symlink privilege
+    # Images: the revision label of the app's own image, not of postgres or redis.
+    app, db = MagicMock(), MagicMock()
+    app.labels = {'org.opencontainers.image.source': 'https://github.com/Wei-Shaw/sub2api',
+                  'org.opencontainers.image.revision': '10ba8f9b4dc2e6023d4a9879ab77b21841babd10'}
+    db.labels = {'org.opencontainers.image.revision': 'f' * 40}
+    client = MagicMock(); client.containers.list.return_value = [db, app]
+    project = {'deploy_root': str(tmp_path/'sub2api'), 'repository': 'Wei-Shaw/sub2api', 'runtime': 'compose',
+               'runtime_config': json.dumps({'project': 'sub2api', 'files': []})}
+    with patch('docker.from_env', return_value=client):
+        assert runtimes.running_commit(project) == '10ba8f9b4dc2e6023d4a9879ab77b21841babd10'
+    assert runtimes.running_commit({**project, 'runtime': 'command', 'runtime_config': '{}'}) == ''
+    assert runtimes.running_commit({**project, 'deploy_root': str(diary)}) == sha
+
+
+def test_install_script_colours_are_removed(tmp_path, monkeypatch):
+    from deploy_platform import config, db, deployer
+    monkeypatch.setattr(config, 'DATABASE', tmp_path/'d.db'); db.init()
+    with db.connect() as c:
+        job = c.execute("INSERT INTO deployments(project_id,action,status,started_at) VALUES(1,'deploy','running',?)", (db.now(),)).lastrowid
+    deployer._append(job, '\x1b[1m==> 创建服务用户\x1b[0m\n下载 50%\r下载 100%\n')
+    with db.connect() as c:
+        assert c.execute('SELECT message FROM deployments').fetchone()[0] == '==> 创建服务用户\n下载 50%下载 100%\n'
+
+
 def test_mentions_must_be_named_like_the_app():
     texts = ['uses https://github.com/cloudflare/vinext', 'REPO_URL=https://github.com/sun20101227/qiyu-diary.git\n']
     assert discovery._mentioned_repository(texts, ['qiyu-diary']) == 'sun20101227/qiyu-diary'

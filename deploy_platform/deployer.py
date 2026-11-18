@@ -2,6 +2,7 @@
 import base64
 import functools
 import os
+import re
 import shutil
 import signal
 import stat
@@ -48,7 +49,12 @@ def _prune(root, keep):
 LOG_LIMIT = 60000  # characters of output kept per deployment record
 
 
+_ANSI = re.compile(r'\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b[()][A-Za-z0-9]|\r(?!\n)')
+
+
 def _append(job, text):
+    # Install scripts print colours and progress bars; the record is plain text.
+    text = _ANSI.sub('', text)
     with db.connect() as c:
         c.execute("UPDATE deployments SET message=substr(message || ?, -?) WHERE id=?", (text, LOG_LIMIT, job))
 
@@ -218,7 +224,12 @@ def _external(job, project, action):
         _note(job,'拉取最新镜像，重启服务并检查状态' if image_app else '重启服务并检查状态')
         # No code to fetch here: for a Compose app the newer image is the update.
         _start(project,root,job,pull=image_app)
-        _note(job,'更新与重启完成')
+        # The app's own updater or the new image decided the version; read back which one runs now.
+        sha = runtimes.running_commit(project)
+        if sha:
+            with db.connect() as c:
+                c.execute('UPDATE deployments SET commit_sha=? WHERE id=?',(sha,job))
+        _note(job,'更新与重启完成' + (f'，正在运行 {sha[:7]}' if sha else ''))
         status = 'succeeded'
     except Exception as exc:
         _note(job,str(exc) if isinstance(exc,RuntimeError) else '更新或重启失败，请检查服务日志')

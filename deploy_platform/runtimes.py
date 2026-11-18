@@ -226,7 +226,38 @@ def status(project):
         state, note = 'degraded', '进程在运行，但健康检查没有通过'
     # Which public domains reach this service, from the reverse proxy's site configs.
     domains = sorted({d for s in discovery.sites() if ports & set(s['ports']) for d in s['domains']}) if ports else []
-    return {'state': state, 'detail': note, 'items': items, 'health': health, 'ports': sorted(ports), 'domains': domains}
+    commit = running_commit(project) if project.get('mode') == 'external' else ''
+    return {'state': state, 'detail': note, 'items': items, 'health': health, 'ports': sorted(ports), 'domains': domains,
+            'commit': commit}
+
+
+def running_commit(project):
+    """Which commit is running, for projects whose folder is not a checkout the platform manages:
+    the release folder's REVISION, or the revision label of the app's image. '' when nothing says."""
+    root = Path(project.get('deploy_root') or '')
+    try:
+        if discovery._release_layout(root):
+            return discovery.release_commit(root)
+        if (root/'.git').exists():
+            r = subprocess.run(['git', '-C', str(root), 'rev-parse', 'HEAD'], capture_output=True, text=True, timeout=5)
+            return r.stdout.strip() if r.returncode == 0 else ''
+        settings = json.loads(project.get('runtime_config') or '{}')
+        runtime = project.get('runtime', 'command')
+        if (runtime == 'compose' and settings.get('project')) or (runtime == 'container' and settings.get('container')):
+            client, containers = _project_containers(runtime, settings)
+            try:
+                labelled = [(c.labels or {}) for c in containers]
+            finally:
+                client.close()
+            # Prefer the image built from this project's repository (not postgres or redis).
+            ordered = sorted(labelled, key=lambda l: discovery.source_repository(l) != project.get('repository'))
+            for labels in ordered:
+                rev = labels.get('org.opencontainers.image.revision', '')
+                if discovery._SHA.fullmatch(rev):
+                    return rev
+    except Exception:
+        pass
+    return ''
 
 
 def logs(project, lines=200):

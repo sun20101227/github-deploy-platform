@@ -333,7 +333,7 @@ def import_project(payload: ImportRequest):
             _check_branch(branch)
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from None
-        mode, message = 'external', '已登记；这个目录不是 Git 仓库，平台不会改动里面的文件'
+        mode, message = 'external', '已登记；平台不会改动这个目录里的文件'
     settings = runtimes.validate(payload.runtime, payload.runtime_config, item['path'])
     if payload.runtime == 'command' and not payload.start_command.strip():
         raise HTTPException(400, '请填写现有服务的重启命令')
@@ -346,7 +346,10 @@ def import_project(payload: ImportRequest):
         now=db.now()
         job=c.execute("INSERT INTO projects(account_id,repository,branch,deploy_root,build_command,start_command,healthcheck_url,webhook_secret,created_at,updated_at,mode,runtime,runtime_config,healthcheck_timeout) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (payload.account_id,repository,branch,item['path'],payload.build_command,payload.start_command,payload.healthcheck_url,secrets.token_hex(32),now,now,mode,payload.runtime,json.dumps(settings),payload.healthcheck_timeout)).lastrowid
-        c.execute("INSERT INTO deployments(project_id,action,status,commit_sha,release_dir,message,started_at,finished_at) VALUES (?,'import','succeeded',?,?,?,?,?)",(job,item['commit'],item['path'],message+'\n',now,now))
+        # The running commit: from the checkout, a release's REVISION, or the image's revision label.
+        commit = item['commit'] or runtimes.running_commit({'deploy_root': item['path'], 'repository': repository,
+                                                            'runtime': payload.runtime, 'runtime_config': json.dumps(settings)})
+        c.execute("INSERT INTO deployments(project_id,action,status,commit_sha,release_dir,message,started_at,finished_at) VALUES (?,'import','succeeded',?,?,?,?,?)",(job,commit,item['path'],message+'\n',now,now))
     return {'id':job}
 
 
@@ -409,7 +412,11 @@ async def check_project(project_id: int):
             "SELECT commit_sha FROM deployments WHERE project_id=? AND status='succeeded' ORDER BY id DESC LIMIT 1",
             (project_id,),
         ).fetchone()
-    return {**latest, "current_sha": current["commit_sha"] if current else "", "available": not current or current["commit_sha"] != latest["sha"]}
+    current_sha = current["commit_sha"] if current else ""
+    if row["mode"] == "external":
+        # Its own updater or a new image may have moved on since the platform's last record: ask the app.
+        current_sha = runtimes.running_commit(dict(row)) or current_sha
+    return {**latest, "current_sha": current_sha, "available": not current_sha or current_sha != latest["sha"]}
 
 
 @app.post("/api/projects/{project_id}/rollback")

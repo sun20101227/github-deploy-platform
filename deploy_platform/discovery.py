@@ -83,7 +83,9 @@ def containers():
                            # Started with docker run: the folder it keeps its data in is the app's folder.
                            'app_dir': '' if project else _mount_app_dir(mounts),
                            # Images built in CI usually say where their code lives (OCI label).
-                           'source': source_repository(labels)})
+                           'source': source_repository(labels),
+                           # ... and which commit they were built from.
+                           'revision': labels.get('org.opencontainers.image.revision', '') if _SHA.fullmatch(labels.get('org.opencontainers.image.revision', '')) else ''})
         return result, ''
     except Exception:
         return [], 'Docker 未运行或当前用户无访问权限'
@@ -328,6 +330,36 @@ def _release_layout(root):
     return (root/'releases').is_dir() and (root/'current').exists()
 
 
+_SHA = re.compile(r'[0-9a-f]{40}')
+
+
+def release_commit(root):
+    """The commit a release layout is running: a REVISION file in the current release,
+    else the hash at the end of its folder name (20261118-003318-fe99e0d), expanded by the bare repo."""
+    root = Path(root)
+    try:
+        current = (root/'current').resolve(strict=True)
+    except OSError:
+        return ''
+    for name in ('REVISION', '.revision', 'COMMIT', '.commit'):
+        value = _read(current/name, 1024).strip()
+        if _SHA.fullmatch(value):
+            return value
+    m = re.search(r'(?:^|[-_.])([0-9a-f]{7,40})$', current.name)
+    if not m:
+        return ''
+    bare = _bare_repository(root)
+    if bare:
+        try:
+            r = subprocess.run(['git', '--git-dir', str(bare), 'rev-parse', '--verify', '-q', m[1] + '^{commit}'],
+                               capture_output=True, text=True, timeout=5)
+            if r.returncode == 0 and _SHA.fullmatch(r.stdout.strip()):
+                return r.stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return m[1]
+
+
 def app_root(value):
     """Walk up from a working directory to the folder that holds the whole app."""
     start = Path(os.path.abspath(value))
@@ -379,6 +411,7 @@ def describe(path):
             item['repository'], item['repository_from'] = repo, 'config'
     if _release_layout(root):
         item['kind'] = 'releases'
+        item['commit'] = release_commit(root)
         item['note'] = (f'有自己的版本目录和更新程序 {item["updater"]}；接入时用它更新。' if item['updater']
                         else '有自己的版本目录（releases/current），通常也有自己的更新程序；接入后填它的更新命令。')
     elif root.is_relative_to('/opt/1panel'):
@@ -399,6 +432,8 @@ def _attach(item, inventory, units, all_sites=(), owners=None):
         # The app's own image is the one that names a source repository (postgres or redis usually don't).
         app = max(sourced, key=lambda c: sum(x.get('source') == c['source'] for x in sourced))
         item['image'] = app.get('image', '')
+        if not item['commit'] and app.get('revision'):
+            item['commit'] = app['revision']
         if not item['repository']:
             item['repository'], item['repository_from'] = app['source'], 'image'
     if not item['repository'] and item['containers']:
