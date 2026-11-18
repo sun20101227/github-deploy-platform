@@ -265,6 +265,8 @@ summary{cursor:pointer;font-size:13px;color:var(--ink)}
 .discovery-row strong{font:600 16px/1.4 var(--serif);color:var(--ink)}
 .discovery-row small{display:block;margin-top:4px;font-size:12px}
 .repo-path{overflow-wrap:anywhere}
+.discovery-row small.note{color:var(--warn);margin-top:6px}
+.hero .error{margin-bottom:0}
 .runtime-hint{color:var(--muted);font-size:12px;overflow-wrap:anywhere}
 .container-list p{padding:12px 0;margin:0;border-bottom:1px solid var(--line)}
 #back-results{margin-bottom:16px}

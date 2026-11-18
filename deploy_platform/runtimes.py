@@ -33,8 +33,9 @@ def validate(runtime, settings, root):
         if not isinstance(unit,str):
             raise RuntimeError('systemd 服务名无效')
         directory = discovery.service_directory(unit)
-        if not directory or Path(directory).resolve() != root:
-            raise RuntimeError('服务 WorkingDirectory 与项目目录不一致，请使用自定义重启命令')
+        # Inside is enough: release layouts run from e.g. <root>/current/.next/standalone.
+        if not directory or not discovery._under(directory, root):
+            raise RuntimeError('服务的 WorkingDirectory 不在项目目录里，请使用自定义重启命令')
         return {'unit': unit}
     if runtime == 'command':
         return {}
@@ -72,7 +73,7 @@ def restart(project, target):
         settings = validate(runtime, settings, target)
         # Releases are fresh clones without the ignored .env; share one kept beside them.
         shared = Path(project.get('deploy_root') or target) / '.env'
-        env_files = [str(shared)] if project.get('mode') != 'existing' and shared.is_file() else []
+        env_files = [str(shared)] if project.get('mode') == 'release' and shared.is_file() else []
         client = DockerClient(compose_files=settings['files'], compose_project_name=settings['project'],
                               compose_project_directory=str(target), compose_env_files=env_files)
         # Keep the original project name so volumes/network/container ownership stay stable.

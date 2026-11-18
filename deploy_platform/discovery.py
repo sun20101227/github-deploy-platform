@@ -72,7 +72,8 @@ def services():
         items=[]
         for block in r.stdout.strip().split('\n\n'):
             data=dict(line.split('=',1) for line in block.splitlines() if '=' in line)
-            if data.get('WorkingDirectory'):
+            # systemd prints "!/path" for optional directories; keep only real absolute paths
+            if data.get('WorkingDirectory', '').startswith('/'):
                 items.append({'unit':data.get('Id',''),'path':data['WorkingDirectory'],'status':data.get('ActiveState','unknown')})
         return items
     except (OSError,subprocess.SubprocessError):
@@ -97,19 +98,115 @@ def scan(root, depth=2):
         if visited > 500 or len(found) >= 100:
             warnings.append('已达到扫描上限，请缩小目录范围')
             break
-        if (p/'.git').exists():
+        if p != base and p.resolve() == config.ROOT.resolve():
+            dirs[:] = []
+            continue
+        # A Git checkout, a release layout, or a directory something on this server runs from.
+        # "Runs from here" means the app's own folder, not a parent like /opt/1panel that holds several.
+        runs_here = any(_app_path(x) and app_root(x).resolve() == p.resolve()
+                        for x in [c['path'] for c in inventory] + [u['path'] for u in units])
+        if (p/'.git').exists() or _release_layout(p) or (p != base and (
+                runs_here or any((p/f).is_file() for f in COMPOSE_FILES))):
             dirs[:] = []
             try:
-                found.append(_attach(inspect(p), inventory, units))
+                found.append(_attach(describe(p), inventory, units))
             except (RuntimeError, OSError):
                 continue
     return {'projects': found, 'containers': inventory, 'warnings': warnings}
 
 
+# Paths that belong to the system, not to an application someone deployed.
+SYSTEM_PREFIXES = ('/usr', '/etc', '/var/lib', '/var/cache', '/var/log', '/run', '/proc', '/sys', '/boot',
+                   '/dev', '/snap', '/lib', '/lib64', '/bin', '/sbin', '/tmp')
+# Stop walking up at these: the app is somewhere below them.
+APP_PARENTS = {'/', '/opt', '/srv', '/home', '/var', '/var/www', '/www', '/root', '/data'}
+
+
+def _app_path(value):
+    if not value or str(value).startswith('!'):
+        return False
+    path = Path(value)
+    if not path.is_absolute() or path == Path(path.anchor):
+        return False
+    text = path.as_posix()
+    return not any(text == p or text.startswith(p + '/') for p in SYSTEM_PREFIXES)
+
+
+def _under(child, root):
+    """True when child is root or inside it, comparing both as written and with symlinks resolved."""
+    if not child:
+        return False
+    child, root = Path(child), Path(root)
+    pairs = [(Path(os.path.abspath(child)), Path(os.path.abspath(root)))]
+    try:
+        pairs.append((child.resolve(), root.resolve()))
+    except OSError:
+        pass
+    return any(c == r or r in c.parents for c, r in pairs)
+
+
+def _bare_repository(root):
+    """A bare repository kept beside the releases, such as qiyu-diary's repo.git."""
+    for candidate in sorted(root.glob('*.git')):
+        if candidate.is_dir() and (candidate/'HEAD').is_file() and (candidate/'objects').is_dir():
+            return candidate
+    return None
+
+
+def _release_layout(root):
+    return (root/'releases').is_dir() and (root/'current').exists()
+
+
+def app_root(value):
+    """Walk up from a working directory to the folder that holds the whole app."""
+    start = Path(os.path.abspath(value))
+    for candidate in [start, *start.parents][:5]:
+        if candidate.as_posix() in APP_PARENTS or candidate == Path(candidate.anchor):
+            break
+        if (candidate/'.git').exists() or _release_layout(candidate) or _bare_repository(candidate):
+            return candidate
+    return start
+
+
+def describe(path):
+    """Like inspect(), but also for apps that are not a Git checkout. Reads only."""
+    root = Path(path).resolve(strict=True)
+    if not root.is_dir():
+        raise RuntimeError('不是目录')
+    if root == config.ROOT.resolve():
+        raise RuntimeError('平台本体请在平台更新页管理')
+    item = {'path': str(root), 'name': root.name, 'kind': 'plain', 'repository': '', 'branch': '', 'commit': '',
+            'dirty': False, 'note': '', 'compose_files': [str(root/f) for f in COMPOSE_FILES if (root/f).is_file()]}
+    if (root/'.git').exists():
+        try:
+            return {**item, **inspect(root), 'kind': 'git'}
+        except RuntimeError as exc:
+            # e.g. a checkout git refuses to read; say so instead of hiding the app
+            return {**item, 'kind': 'git', 'note': f'Git 仓库读取失败：{exc}'}
+    bare = _bare_repository(root)
+    if bare:
+        try:
+            with Repo(bare) as repo:
+                # Without an origin the bare repo only receives pushes; its HEAD branch says nothing then.
+                if 'origin' in repo.remotes:
+                    item['repository'] = repository_name(repo.remotes.origin.url)
+                    item['branch'] = '' if repo.head.is_detached else repo.active_branch.name
+        except Exception:
+            pass
+    if _release_layout(root):
+        item['kind'] = 'releases'
+        item['note'] = '有自己的版本目录（releases/current），通常也有自己的更新程序；接入后填它的更新命令。'
+    elif root.is_relative_to('/opt/1panel'):
+        item['note'] = '由 1Panel 管理的应用，建议继续在 1Panel 里更新。'
+    else:
+        item['note'] = '不是 Git 仓库。接入后平台不改动这里的文件，更新时执行构建和重启。'
+    return item
+
+
 def _attach(item, inventory, units):
-    root = Path(item['path'])
-    item['containers'] = [c for c in inventory if c['path'] and Path(c['path']).resolve() == root]
-    item['services'] = [u for u in units if Path(u['path']).resolve() == root]
+    root = item['path']
+    item['containers'] = [c for c in inventory if _under(c['path'], root)]
+    item['services'] = [u for u in units if _under(u['path'], root)]
     return item
 
 
@@ -119,14 +216,16 @@ def running():
     units = services()
     found, seen = [], set()
     for value in [c['path'] for c in inventory] + [u['path'] for u in units]:
-        if not value or value in seen or len(seen) >= 300:
+        if not _app_path(value) or value in seen or len(seen) >= 300:
             continue
         seen.add(value)
         try:
-            path = Path(value).resolve(strict=True)
-            if path == Path(path.anchor) or any(f['path'] == str(path) for f in found):
-                continue
-            found.append(_attach(inspect(path), inventory, units))
+            item = describe(app_root(value))
         except (RuntimeError, OSError):
-            continue  # not a Git checkout, unreadable, or the platform itself
+            continue  # gone, unreadable, or the platform itself
+        if item['path'] == str(Path(item['path']).anchor) or any(f['path'] == item['path'] for f in found):
+            continue
+        found.append(_attach(item, inventory, units))
+    # Git checkouts first, then apps with a GitHub repository, then the rest.
+    found.sort(key=lambda p: (p['kind'] != 'git', not p['repository'], p['name']))
     return {'projects': found, 'containers': inventory, 'warnings': [warning] if warning else []}

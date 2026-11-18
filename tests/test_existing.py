@@ -267,7 +267,8 @@ def test_running_services_are_found_without_a_directory(setup,tmp_path):
            {'unit':'gone.service','path':str(tmp_path/'missing'),'status':'failed'}]
     with patch.object(discovery,'containers',return_value=(inventory,'')),patch.object(discovery,'services',return_value=units):
         found=client.get('/api/discovery/running').json()
-        assert [p['path'] for p in found['projects']]==[str(root)]
+        # The Git checkout first; a directory a service runs from is listed too, even without Git.
+        assert [(p['path'],p['kind']) for p in found['projects']]==[(str(root),'git'),(str(plain.resolve()),'plain')]
         item=found['projects'][0]
         assert item['repository']=='example/demo' and not item['imported']
         assert [c['name'] for c in item['containers']]==['demo-web-1']
@@ -276,6 +277,70 @@ def test_running_services_are_found_without_a_directory(setup,tmp_path):
         import_project(root,client)
         assert client.get('/api/discovery/running').json()['projects'][0]['imported']
         assert client.post('/api/discovery/scan',json={'root':str(root.parent)}).json()['projects'][0]['imported']
+
+
+def test_non_git_apps_are_found_and_can_be_updated(setup,tmp_path):
+    """The real server: a release layout with a bare repo (qiyu-diary) and a Compose app without Git (sub2api)."""
+    _,_,client=setup
+    diary=tmp_path/'opt'/'qiyu-diary'
+    release=diary/'releases'/'20261118-fe99e0d'/'.next'/'standalone';release.mkdir(parents=True)
+    try:
+        (diary/'current').symlink_to(diary/'releases'/'20261118-fe99e0d',target_is_directory=True)
+    except OSError:  # Windows without the symlink privilege; the layout check only needs current/ to exist
+        (diary/'current'/'.next'/'standalone').mkdir(parents=True)
+    bare=Repo.init(diary/'repo.git',bare=True,initial_branch='main')
+    bare.create_remote('origin','https://github.com/sun20101227/qiyu-diary.git');bare.close()
+    sub=tmp_path/'opt'/'sub2api';sub.mkdir();(sub/'docker-compose.yml').write_text('services: {}');(sub/'.env').write_text('SECRET=keep')
+    inventory=[{'name':'sub2api','status':'running','project':'sub2api','path':str(sub),'files':[str(sub/'docker-compose.yml')]},
+               {'name':'openlist','status':'running','project':'','path':'','files':['']}]
+    units=[{'unit':'qiyu-diary.service','path':str(diary/'current'/'.next'/'standalone'),'status':'active'},
+           {'unit':'ubuntu-advantage.service','path':'/var/lib/ubuntu-advantage','status':'active'},
+           {'unit':'systemd-sysusers.service','path':'!/root','status':'inactive'}]
+    with patch.object(discovery,'containers',return_value=(inventory,'')),patch.object(discovery,'services',return_value=units):
+        found={p['name']:p for p in client.get('/api/discovery/running').json()['projects']}
+    assert set(found)=={'qiyu-diary','sub2api'}
+    assert found['qiyu-diary']['kind']=='releases' and found['qiyu-diary']['repository']=='sun20101227/qiyu-diary'
+    assert [u['unit'] for u in found['qiyu-diary']['services']]==['qiyu-diary.service']
+    assert found['sub2api']['kind']=='plain' and found['sub2api']['repository']==''
+    assert [c['name'] for c in found['sub2api']['containers']]==['sub2api']
+    # Importing a non-Git directory needs the repository; it becomes an "external" project.
+    payload={'path':str(sub),'account_id':1,'runtime':'compose','runtime_config':{'project':'sub2api','files':['docker-compose.yml']}}
+    assert client.post('/api/projects/import',json=payload).status_code==400
+    r=client.post('/api/projects/import',json={**payload,'repository':'Wei-Shaw/sub2api','branch':'main'})
+    assert r.status_code==200,r.text
+    p=client.get(f"/api/projects/{r.json()['id']}").json()
+    assert p['mode']=='external' and p['repository']=='Wei-Shaw/sub2api'
+    # The release layout imports from its root; the service running from current/ counts as inside it.
+    with patch.object(discovery,'service_directory',return_value=str(diary/'current'/'.next'/'standalone')):
+        r=client.post('/api/projects/import',json={'path':str(diary),'account_id':1,'runtime':'systemd','runtime_config':{'unit':'qiyu-diary.service'}})
+    assert r.status_code==200,r.text
+    assert client.get(f"/api/projects/{r.json()['id']}").json()['repository']=='sun20101227/qiyu-diary'
+    assert client.post('/api/projects/import',json={'path':'/var/lib','account_id':1,'repository':'a/b','start_command':'x'}).status_code==400
+    # Updating it builds and restarts in place without touching the files; rollback is refused.
+    with db.connect() as c:
+        job=c.execute("INSERT INTO deployments(project_id,action,status,started_at) VALUES (?,'update','queued',?)",(p['id'],db.now())).lastrowid
+    start=Mock()
+    with patch.object(deployer,'_start',start):
+        deployer._execute(job,{},{**p,'build_command':''},'update')
+    assert start.call_args.args[1]==sub
+    assert (sub/'.env').read_text()=='SECRET=keep' and not (sub/'.git').exists()
+    with db.connect() as c:
+        row=c.execute('SELECT status,message FROM deployments WHERE id=?',(job,)).fetchone()
+    assert row['status']=='succeeded' and '更新与重启完成' in row['message']
+    assert client.post(f"/api/projects/{p['id']}/rollback").status_code==409
+
+
+def test_logged_in_gh_is_connected_without_a_click(setup):
+    _,_,client=setup
+    with db.connect() as c:
+        c.execute('DELETE FROM github_accounts')
+    with patch.object(api.cli_auth,'identity',side_effect=RuntimeError('gh 未登录。gh 的提示：You are not logged into any GitHub hosts.')):
+        assert client.get('/api/accounts').json()==[]
+        status=client.get('/api/github/status').json()
+    assert not status['connected'] and 'not logged into' in status['message']
+    with patch.object(api.cli_auth,'identity',return_value={'github_id':'222027986','login':'sun20101227'}):
+        accounts=client.get('/api/accounts').json()
+    assert [a['login'] for a in accounts]==['sun20101227']
 
 
 def test_deployment_history_is_limited(setup):

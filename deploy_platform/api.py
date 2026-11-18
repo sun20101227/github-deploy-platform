@@ -10,6 +10,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 from pathlib import Path
 import json
+import re
 import uuid
 from typing import Literal
 
@@ -41,6 +42,12 @@ async def admin_access(request, call_next):
 
 
 
+def _check_branch(value):
+    if not value or value.startswith('-') or any(c.isspace() for c in value) or '..' in value or any(c in value for c in '~^:?*[\\'):
+        raise ValueError('分支名称无效')
+    return value
+
+
 class ProjectCreate(BaseModel):
     account_id: int
     repository: str = Field(pattern=r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
@@ -62,9 +69,7 @@ class ProjectCreate(BaseModel):
     @field_validator('branch')
     @classmethod
     def valid_branch(cls, value):
-        if not value or value.startswith('-') or any(c.isspace() for c in value) or '..' in value or any(c in value for c in '~^:?*[\\'):
-            raise ValueError('分支名称无效')
-        return value
+        return _check_branch(value)
 
     @field_validator('deploy_root')
     @classmethod
@@ -81,8 +86,27 @@ def health():
     return {"ok": True, "instance": INSTANCE}
 
 
+def _connect_cli_account():
+    """Store the server's gh identity as an account. The token itself stays with gh."""
+    user = cli_auth.identity()
+    with db.connect() as conn:
+        conn.execute(
+            "INSERT INTO github_accounts(github_id,login,access_token,created_at,updated_at) VALUES (?,?,?,?,?) "
+            "ON CONFLICT(github_id) DO UPDATE SET login=excluded.login,access_token=excluded.access_token,updated_at=excluded.updated_at",
+            (user['github_id'], user['login'], 'gh-cli:'+user['github_id'], db.now(), db.now()))
+    return user
+
+
 @app.get("/api/accounts")
 def accounts():
+    with db.connect() as conn:
+        empty = not conn.execute("SELECT 1 FROM github_accounts").fetchone()
+    if empty:
+        # A logged-in gh is all that is needed; do not make people find a "connect" button first.
+        try:
+            _connect_cli_account()
+        except RuntimeError:
+            pass  # not logged in; the GitHub page shows gh's own message
     with db.connect() as conn:
         return [dict(row) for row in conn.execute("SELECT id, github_id, login, created_at, updated_at FROM github_accounts")]
 
@@ -149,6 +173,9 @@ class ImportRequest(BaseModel):
     build_command: str = ''
     healthcheck_url: str = ''
     healthcheck_timeout: int = Field(default=45, ge=5, le=600)
+    # Only for directories that are not a Git checkout: which GitHub repository the app comes from.
+    repository: str = ''
+    branch: str = ''
 
 
 def _mark_imported(result):
@@ -176,11 +203,27 @@ def scan_running():
 @app.post('/api/projects/import')
 def import_project(payload: ImportRequest):
     try:
-        item = discovery.inspect(payload.path)
+        item = discovery.describe(payload.path)
     except OSError:
         raise HTTPException(400, '目录不存在或无法读取') from None
-    if not item['repository'] or not item['branch']:
-        raise HTTPException(400, '需要 GitHub origin 和已检出的本地分支')
+    root = Path(item['path'])
+    if root == Path(root.anchor) or not discovery._app_path(str(root)):
+        raise HTTPException(400, '请选择应用自己的目录，不要选系统目录')
+    if item['kind'] == 'git':
+        if not item['repository'] or not item['branch']:
+            raise HTTPException(400, item['note'] or '需要 GitHub origin 和已检出的本地分支')
+        mode, repository, branch, message = 'existing', item['repository'], item['branch'], '已登记当前提交；未修改代码或重启服务'
+    else:
+        # Not a Git checkout: the platform never touches the files, it runs build and restart.
+        repository = (payload.repository or item['repository']).strip()
+        branch = (payload.branch or item['branch'] or 'main').strip()
+        if not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', repository):
+            raise HTTPException(400, '请选择这个应用对应的 GitHub 仓库')
+        try:
+            _check_branch(branch)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from None
+        mode, message = 'external', '已登记；这个目录不是 Git 仓库，平台不会改动里面的文件'
     settings = runtimes.validate(payload.runtime, payload.runtime_config, item['path'])
     if payload.runtime == 'command' and not payload.start_command.strip():
         raise HTTPException(400, '请填写现有服务的重启命令')
@@ -188,13 +231,12 @@ def import_project(payload: ImportRequest):
         if not c.execute('SELECT 1 FROM github_accounts WHERE id=?',(payload.account_id,)).fetchone():
             raise HTTPException(404,'GitHub 账号不存在')
         paths=[Path(r[0]).resolve() for r in c.execute('SELECT deploy_root FROM projects')]
-        root=Path(item['path'])
         if any(root==p or root.is_relative_to(p) or p.is_relative_to(root) for p in paths):
             raise HTTPException(409,'目录与已有项目重叠')
         now=db.now()
-        job=c.execute("INSERT INTO projects(account_id,repository,branch,deploy_root,build_command,start_command,healthcheck_url,webhook_secret,created_at,updated_at,mode,runtime,runtime_config,healthcheck_timeout) VALUES (?,?,?,?,?,?,?,?,?,?,'existing',?,?,?)",
-            (payload.account_id,item['repository'],item['branch'],item['path'],payload.build_command,payload.start_command,payload.healthcheck_url,secrets.token_hex(32),now,now,payload.runtime,json.dumps(settings),payload.healthcheck_timeout)).lastrowid
-        c.execute("INSERT INTO deployments(project_id,action,status,commit_sha,release_dir,message,started_at,finished_at) VALUES (?,'import','succeeded',?,?,'已登记当前提交；未修改代码或重启服务',?,?)",(job,item['commit'],item['path'],now,now))
+        job=c.execute("INSERT INTO projects(account_id,repository,branch,deploy_root,build_command,start_command,healthcheck_url,webhook_secret,created_at,updated_at,mode,runtime,runtime_config,healthcheck_timeout) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (payload.account_id,repository,branch,item['path'],payload.build_command,payload.start_command,payload.healthcheck_url,secrets.token_hex(32),now,now,mode,payload.runtime,json.dumps(settings),payload.healthcheck_timeout)).lastrowid
+        c.execute("INSERT INTO deployments(project_id,action,status,commit_sha,release_dir,message,started_at,finished_at) VALUES (?,'import','succeeded',?,?,?,?,?)",(job,item['commit'],item['path'],message+'\n',now,now))
     return {'id':job}
 
 
@@ -328,13 +370,7 @@ def github_status():
 
 @app.post("/api/github/connect")
 def github_connect():
-    user = cli_auth.identity()
-    with db.connect() as conn:
-        conn.execute(
-            "INSERT INTO github_accounts(github_id,login,access_token,created_at,updated_at) VALUES (?,?,?,?,?) "
-            "ON CONFLICT(github_id) DO UPDATE SET login=excluded.login,access_token=excluded.access_token,updated_at=excluded.updated_at",
-            (user['github_id'], user['login'], 'gh-cli:'+user['github_id'], db.now(), db.now()))
-    return user
+    return _connect_cli_account()
 
 
 @app.get("/api/projects/{project_id}")
@@ -350,7 +386,7 @@ def project_detail(project_id: int):
 def edit_project(project_id: int, payload: ProjectCreate):
     project = project_detail(project_id)
     runtime = payload.runtime
-    if project['mode'] == 'existing':
+    if project['mode'] in ('existing', 'external'):
         settings = runtimes.validate(runtime, payload.runtime_config, project['deploy_root'])
     else:
         settings = runtimes.validate_release(runtime, payload.runtime_config, project['repository'])

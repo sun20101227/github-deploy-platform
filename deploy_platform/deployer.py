@@ -73,7 +73,8 @@ def _start(project, target):
     env['DEPLOY_PROJECT_ROOT'] = project['deploy_root']
     if not runtimes.restart(project, target):
         command = project['start_command']
-        _run(['cmd', '/c', command] if os.name == 'nt' else ['sh', '-c', command], cwd=target, env=env, timeout=120)
+        # An app's own updater (e.g. systemctl start qiyu-updater) can build for several minutes.
+        _run(['cmd', '/c', command] if os.name == 'nt' else ['sh', '-c', command], cwd=target, env=env, timeout=1800)
     url = project.get('healthcheck_url')
     if url:
         wait = int(project.get('healthcheck_timeout') or 45)
@@ -141,7 +142,35 @@ def _rerun(project_id):
     if project and account:
         deploy(project_id,account=dict(account),project=dict(project),action='webhook',queue=True)
 
+def _external(job, project, action):
+    """An app that is not a Git checkout (copied files, an image, or its own updater):
+    leave the files alone, run the build and the restart, check health."""
+    root = Path(project['deploy_root'])
+    try:
+        if action == 'rollback':
+            raise DeploymentError('这个项目的版本由它自己管理，平台不能回滚')
+        with db.connect() as c:
+            c.execute("UPDATE deployments SET status='running',release_dir=? WHERE id=?",(str(root),job))
+        if project['build_command']:
+            _note(job,'执行构建')
+            cmd = project['build_command']
+            output = _run(['cmd','/c',cmd] if os.name=='nt' else ['sh','-c',cmd],cwd=root,timeout=1800)
+            if output:
+                _note(job,output[-4000:])
+        _note(job,'重启服务并检查状态')
+        _start(project,root)
+        _note(job,'更新与重启完成')
+        status = 'succeeded'
+    except Exception as exc:
+        _note(job,str(exc) if isinstance(exc,RuntimeError) else '更新或重启失败，请检查服务日志')
+        status = 'failed'
+    with db.connect() as c:
+        c.execute('UPDATE deployments SET status=?,finished_at=? WHERE id=?',(status,db.now(),job))
+
 def _execute(job, account, project, action):
+    if project.get('mode') == 'external':
+        _external(job, project, action)
+        return
     if project.get('mode') == 'existing':
         try:
             existing.execute(job,account,project,action,_note,_start,_run)

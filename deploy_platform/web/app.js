@@ -65,12 +65,13 @@ const OK_LINES = /^(健康检查通过|服务已重启|更新与重启完成|已
 const BAD_LINES = /失败|未通过|中断|无法|超过|不符合|已改变|已分叉|请先|不存在/;
 function stepsFor(project, job){
   if(!job || job.action==='import') return '';
-  const names = [job.action==='rollback' ? '准备旧版本' : '拉取代码'];
+  // A project that is not a Git checkout has no fetch step: the platform only builds and restarts.
+  const names = project.mode==='external' ? [] : [job.action==='rollback' ? '准备旧版本' : '拉取代码'];
   if(project.build_command) names.push('构建');
   names.push(project.healthcheck_url ? '重启并检查健康' : '重启服务');
   const msg = job.message || '';
   let reached = job.status==='queued' ? -1 : 0;
-  if(/执行构建/.test(msg) && project.build_command) reached = 1;
+  if(/执行构建/.test(msg) && project.build_command) reached = names.indexOf('构建');
   if(/切换版本|重启服务/.test(msg)) reached = names.length - 1;
   const done = job.status==='succeeded';
   const failed = !ACTIVE.includes(job.status) && !done;
@@ -112,7 +113,7 @@ async function projectsPage(t){
     const q = ($('#search')?.value||'').toLowerCase();
     const list = rows.filter(p=>(p.repository+' '+p.branch).toLowerCase().includes(q));
     $('#project-list').innerHTML = list.map((p,i)=>`<a class="project-row" style="--i:${i}" href="#/project/${p.id}">
-      <div><strong>${esc(p.repository.split('/').pop())}${p.mode==='existing'?'<span class="kind">已接入</span>':''}</strong><small>${esc(p.repository)} · ${esc(p.branch)}</small></div>
+      <div><strong>${esc(p.repository.split('/').pop())}${p.mode==='existing'||p.mode==='external'?'<span class="kind">已接入</span>':''}</strong><small>${esc(p.repository)} · ${esc(p.branch)}</small></div>
       <div>${badge(p.job?.status)}</div><span class="when">${p.job ? when(p.job.finished_at || p.job.started_at) : '尚未部署'}</span>
       <code class="commit">${esc(p.job?.commit_sha?.slice(0,8)||'—')}</code><span class="arrow" aria-hidden="true">↗</span></a>`).join('') || '<div class="empty">没有匹配的项目</div>';
   }
@@ -122,16 +123,22 @@ async function projectsPage(t){
 
 /* ---- GitHub ---- */
 async function githubPage(t){
-  const accounts = await api('/api/accounts'); if(t!==epoch) return;
-  $('#content').innerHTML = header('GitHub','使用服务器上的 GitHub CLI 账号。') + `<div class="narrow"><section class="section"><h2>已连接账号</h2>${accounts.length?`<div class="sheet">${accounts.map((a,i)=>`<div class="account-line" style="--i:${i}"><span class="avatar">${esc(a.login[0].toUpperCase())}</span><div><strong>${esc(a.login)}</strong><small>用于读取仓库和拉取代码</small></div><span class="badge succeeded">已连接</span></div>`).join('')}</div>`:'<p>尚未连接。</p>'}</section>
-    <section class="section"><h2>连接服务器账号</h2><p>在服务器终端，用运行平台的用户执行：</p><div class="command"><code>gh auth login --hostname github.com --web</code><button id="copy-login" class="text">复制</button></div><p>完成浏览器授权后，点击下面的按钮。不需要创建 OAuth App。</p><button id="connect" class="primary">读取并连接账号</button><p id="error" class="error" role="alert"></p></section></div>`;
+  // accounts connects a logged-in gh by itself; status says what gh itself reports
+  const [accounts, gh] = await Promise.all([api('/api/accounts'), api('/api/github/status')]); if(t!==epoch) return;
+  const live = gh.connected ? accounts.find(a=>a.github_id===gh.github_id) : null;
+  $('#content').innerHTML = header('GitHub','使用服务器上的 GitHub CLI 账号。') + `<div class="narrow">
+    <section class="card hero ${gh.connected?'ok':'bad'}"><h2>服务器上的 gh</h2>${gh.connected
+      ? `<p class="state-line"><span class="badge succeeded">已登录</span> ${esc(gh.login)}${live?'，已用于读取仓库和拉取代码。':'。'}</p>`
+      : `<p class="state-line"><span class="badge failed">未登录</span></p><p class="error">${esc(gh.message||'读不到 gh 的登录状态')}</p>`}</section>
+    <section class="section"><h2>已连接账号</h2>${accounts.length?`<div class="sheet">${accounts.map((a,i)=>`<div class="account-line" style="--i:${i}"><span class="avatar">${esc(a.login[0].toUpperCase())}</span><div><strong>${esc(a.login)}</strong><small>${gh.connected&&a.github_id===gh.github_id?'当前 gh 登录的账号':'gh 当前没有登录这个账号，拉取代码会失败'}</small></div><span class="badge ${gh.connected&&a.github_id===gh.github_id?'succeeded':'failed'}">${gh.connected&&a.github_id===gh.github_id?'可用':'不可用'}</span></div>`).join('')}</div>`:'<p>还没有账号。gh 登录后打开这个页面会自动连接。</p>'}</section>
+    <section class="section"><h2>${gh.connected?'换一个账号':'登录 gh'}</h2><p>在服务器终端，用运行平台的系统用户执行：</p><div class="command"><code>gh auth login --hostname github.com --web</code><button id="copy-login" class="text">复制</button></div><p>完成浏览器授权后，点击下面的按钮。</p><button id="connect" class="${gh.connected&&live?'':'primary'}">重新读取 gh 账号</button><p id="error" class="error" role="alert"></p></section></div>`;
   $('#copy-login').onclick = ()=>copy('gh auth login --hostname github.com --web');
   $('#connect').onclick = e=>busy(e.currentTarget,async()=>{const a=await api('/api/github/connect',{});toast(`已连接 ${a.login}`);route()});
 }
 
 /* ---- 新建项目与设置表单 ---- */
 function releaseRuntime(p={}){const s=JSON.parse(p.runtime_config||'{}');const r=p.runtime||'compose';return `<label>部署后重启方式<select name="runtime"><option value="compose" ${r==='compose'?'selected':''}>Docker Compose（自动构建并重启）</option><option value="command" ${r==='command'?'selected':''}>自定义命令</option></select><small>每次部署、自动更新和回滚后都会重启服务。</small></label><div data-runtime="compose"><label>Compose 项目名<input name="compose_project" data-optional value="${esc(s.project||'')}" placeholder="留空使用仓库名" pattern="[a-z0-9][a-z0-9_\\-]*"><small>每次部署沿用同一个项目名，不会另建一套容器和数据卷。</small></label><label>Compose 文件<input name="compose_files" data-optional value="${esc((s.files||[]).join(','))}" placeholder="留空自动识别 compose.yaml"><small>仓库内的相对路径。部署目录下的 .env 会自动传给 Compose；持久数据请用命名卷或版本目录之外的路径。</small></label></div>`}
-function fields(p={},edit=false){return `<label>分支<input name="branch" required value="${esc(p.branch||'main')}" maxlength="200"></label>${!edit?'<label>部署目录<input name="deploy_root" required placeholder="/opt/apps/my-app"><small>此服务器上的绝对路径。</small></label>':''}<label>构建命令<input name="build_command" value="${esc(p.build_command||'')}" placeholder="例如 npm ci && npm run build"><small>${p.mode==='existing'?'在原项目目录执行，可留空。':'在新版本目录执行，可留空。'}</small></label>${p.mode==='existing'?'':releaseRuntime(p)}<label>${p.mode==='existing'?'重启命令':'启动 / 重启命令'}<input name="start_command" required value="${esc(p.start_command||'')}" placeholder="例如 pm2 restart my-app --update-env"><small>使用进程管理器重启服务，完成后退出。${p.mode==='existing'?'在原项目目录执行。':''}</small></label><label>健康检查地址<input name="healthcheck_url" type="url" value="${esc(p.healthcheck_url||'')}" placeholder="http://127.0.0.1:3000/health"><small>返回 2xx 才算通过；留空时只检查重启是否完成。</small></label><label>健康检查最长等待（秒）<input name="healthcheck_timeout" type="number" required min="5" max="600" value="${esc(p.healthcheck_timeout||45)}"><small>超过这个时间仍未通过就判定失败并恢复旧版本；启动慢的服务可以调大。</small></label>`}
+function fields(p={},edit=false){const inPlace=p.mode==='existing'||p.mode==='external';return `<label>分支<input name="branch" required value="${esc(p.branch||'main')}" maxlength="200"></label>${!edit?'<label>部署目录<input name="deploy_root" required placeholder="/opt/apps/my-app"><small>此服务器上的绝对路径。</small></label>':''}<label>构建命令<input name="build_command" value="${esc(p.build_command||'')}" placeholder="例如 npm ci && npm run build"><small>${inPlace?'在原项目目录执行，可留空。':'在新版本目录执行，可留空。'}</small></label>${inPlace?'':releaseRuntime(p)}<label>${inPlace?'重启命令':'启动 / 重启命令'}<input name="start_command" required value="${esc(p.start_command||'')}" placeholder="例如 pm2 restart my-app --update-env"><small>使用进程管理器重启服务，完成后退出。${inPlace?'在原项目目录执行。':''}</small></label><label>健康检查地址<input name="healthcheck_url" type="url" value="${esc(p.healthcheck_url||'')}" placeholder="http://127.0.0.1:3000/health"><small>返回 2xx 才算通过；留空时只检查重启是否完成。</small></label><label>健康检查最长等待（秒）<input name="healthcheck_timeout" type="number" required min="5" max="600" value="${esc(p.healthcheck_timeout||45)}"><small>超过这个时间仍未通过就判定失败并恢复旧版本；启动慢的服务可以调大。</small></label>`}
 async function newPage(t){
   const accounts = await api('/api/accounts'); if(t!==epoch) return;
   $('#content').innerHTML = '<a class="back" href="#/projects">← 项目</a>' + header('新建项目','从 GitHub 仓库部署到这台服务器，每次部署是一个独立版本，可以回滚。') + (accounts.length ? `<form id="new-form" class="form"><div class="step-label">01 / 代码来源</div><div class="pair"><label>账号<select name="account_id" id="account">${accounts.map(a=>`<option value="${a.id}">${esc(a.login)}</option>`).join('')}</select></label><label>仓库<select name="repository" id="repository" required disabled><option value="">正在加载…</option></select></label></div><div class="section"><div class="step-label">02 / 运行配置</div>${fields()}</div><p id="error" class="error" role="alert"></p><div class="buttons"><button class="primary" id="save">创建项目</button><a class="button" href="#/projects">取消</a></div></form>` : empty('先连接 GitHub','连接后可以选择公开和私有仓库。','#/github','连接 GitHub'));
@@ -161,15 +168,16 @@ async function projectPage(id,tab,t){
   const current = jobs.find(j=>j.status==='succeeded');
   const root = `#/project/${id}`;
   const validTab = ['overview','history','settings'].includes(tab) ? tab : 'overview';
-  const existing = p.mode==='existing';
-  const action = existing ? '更新' : current ? '部署最新版本' : '首次部署';
+  const existing = p.mode==='existing', external = p.mode==='external';
+  const action = existing || external ? '更新' : current ? '部署最新版本' : '首次部署';
   $('#content').innerHTML = `<a class="back" href="#/projects">← 项目</a>` +
     header(p.repository.split('/').pop(), `${p.repository} · ${p.branch}`, `<button class="primary" id="deploy" ${active?'disabled':''}>${active?'<span class="spinner" aria-hidden="true"></span>部署中':action}</button>`) +
     `<nav class="tabs" aria-label="项目导航">${[['overview','概览'],['history','部署记录',jobs.length],['settings','设置']].map(([key,label,n])=>`<a class="${validTab===key?'active':''}" href="${root}/${key}"${validTab===key?' aria-current="page"':''}>${label}${n?`<span class="count">${n}</span>`:''}</a>`).join('')}</nav><p id="error" class="error" role="alert"></p><div id="project-body"></div>`;
   // 先确认、再进入加载状态：等人决定的时候按钮不该转圈
   $('#deploy').onclick = async e=>{
     const btn = e.currentTarget;
-    const copyText = existing ? `将在原目录拉取 ${p.branch} 分支并快进合并，构建后重启服务。` : `将拉取 ${p.branch} 分支到新版本目录，构建完成后切换版本并重启服务。`;
+    const copyText = external ? '这个目录不是 Git 仓库：将执行构建命令和重启（或项目自己的更新命令），然后检查服务状态。'
+      : existing ? `将在原目录拉取 ${p.branch} 分支并快进合并，构建后重启服务。` : `将拉取 ${p.branch} 分支到新版本目录，构建完成后切换版本并重启服务。`;
     if(!await confirmAction(action, copyText, action)) return;
     busy(btn,async()=>{
     const r = await api(`/api/projects/${id}/deploy`,{});
@@ -185,10 +193,12 @@ async function projectPage(id,tab,t){
       ${active ? `<section class="card hero new"><h2>正在${actionNames[active.action]||'部署'} · #${active.id}</h2>${stepsFor(p,active)}<p class="state-line"><span class="spinner" aria-hidden="true"></span>已进行 ${took(active)}，完成后自动刷新。</p><a class="button" href="${root}/history">查看输出</a></section>` : ''}
       <section class="card"><h2>当前版本</h2><dl class="kv"><dt>提交</dt><dd>${current ? sha(p.repository,current.commit_sha,12) : '<span class="muted">尚未部署</span>'}</dd><dt>分支</dt><dd>${esc(p.branch)}</dd><dt>部署时间</dt><dd>${current ? `${when(current.finished_at)} <small>· ${esc(stamp(current.finished_at))}</small>` : '—'}</dd><dt>最近任务</dt><dd>${badge(last?.status)}${last && last!==current ? ` <small>${when(last.started_at)}</small>` : ''}</dd></dl>
         <div class="buttons"><button id="check">检查更新</button><button id="rollback" ${canRollback?'':'disabled'}>回滚上一版</button></div><div id="check-result" class="settings-note" role="status"></div></section>
-    </div><div class="card info"><h3>${existing?'原目录 · 已接入':'部署目录'}</h3><p class="mono">${esc(p.deploy_root)}</p><h3>重启方式</h3><p>${runtimeText(p)}</p><h3>健康检查</h3><p class="muted">${esc(p.healthcheck_url||'未配置')}${p.healthcheck_url?` <small>· 最长 ${esc(p.healthcheck_timeout||45)} 秒</small>`:''}</p></div></div>`;
+    </div><div class="card info"><h3>${existing?'原目录 · 已接入':external?'原目录 · 已接入（不是 Git 仓库）':'部署目录'}</h3><p class="mono">${esc(p.deploy_root)}</p><h3>重启方式</h3><p>${runtimeText(p)}</p><h3>健康检查</h3><p class="muted">${esc(p.healthcheck_url||'未配置')}${p.healthcheck_url?` <small>· 最长 ${esc(p.healthcheck_timeout||45)} 秒</small>`:''}</p></div></div>`;
     $('#check').onclick = e=>busy(e.currentTarget,async()=>{
       const d = await api(`/api/projects/${id}/check`);
-      $('#check-result').innerHTML = `<div class="versions${d.available?' new':''}"><div><span>当前部署</span><strong>${esc(d.current_sha?.slice(0,7)||'—')}</strong></div><span class="to" aria-hidden="true">${d.available?'→':'='}</span><div><span>GitHub 上最新</span><strong>${esc(d.sha.slice(0,7))}</strong><small title="${esc(d.message)}">${esc(d.message)}</small></div></div><p class="state-line">${d.available?'有新提交可以部署。':'已经是最新版本。'}${d.date?` <small>${when(d.date)}提交</small>`:''}</p>`;
+      // Not a Git checkout: the platform cannot tell which commit is running, so do not claim one.
+      const unknown = external && !d.current_sha;
+      $('#check-result').innerHTML = `<div class="versions${d.available&&!unknown?' new':''}"><div><span>当前部署</span><strong>${esc(d.current_sha?.slice(0,7)||'—')}</strong>${unknown?'<small>由项目自己管理</small>':''}</div><span class="to" aria-hidden="true">${unknown?'·':d.available?'→':'='}</span><div><span>GitHub 上最新</span><strong>${esc(d.sha.slice(0,7))}</strong><small title="${esc(d.message)}">${esc(d.message)}</small></div></div><p class="state-line">${unknown?'这个目录不是 Git 仓库，看不出正在运行哪个提交；点“更新”会执行更新命令。':d.available?'有新提交可以部署。':'已经是最新版本。'}${d.date?` <small>${when(d.date)}提交</small>`:''}</p>`;
     });
     $('#rollback').onclick = async e=>{
       const btn = e.currentTarget;
@@ -222,7 +232,7 @@ async function projectPage(id,tab,t){
   }
 
   if(validTab==='settings'){
-    body.innerHTML = `<form class="form" id="settings"><h2>运行配置</h2>${existing?runtimeFields(p.runtime,JSON.parse(p.runtime_config||'{}')):''}${fields(p,true)}<div class="buttons"><button class="primary" ${active?'disabled':''}>保存配置</button>${active?'<small>部署进行中，结束后才能修改。</small>':''}</div></form>
+    body.innerHTML = `<form class="form" id="settings"><h2>运行配置</h2>${existing||external?runtimeFields(p.runtime,JSON.parse(p.runtime_config||'{}')):''}${fields(p,true)}<div class="buttons"><button class="primary" ${active?'disabled':''}>保存配置</button>${active?'<small>部署进行中，结束后才能修改。</small>':''}</div></form>
       <details class="narrow"><summary>自动更新 · GitHub Webhook</summary><dl class="kv"><dt>Payload URL</dt><dd><code>${esc(location.origin+'/webhooks/github/'+id)}</code> <button class="text" id="copy-hook" type="button">复制</button></dd><dt>Content type</dt><dd>application/json</dd><dt>事件</dt><dd>Push</dd></dl><button id="secret" type="button">显示 Secret</button><pre id="secret-value" hidden></pre></details>`;
     $('#copy-hook').onclick = ()=>copy(location.origin+'/webhooks/github/'+id);
     $('#secret').onclick = ()=>{ const v=$('#secret-value'); v.hidden=!v.hidden; v.textContent=p.webhook_secret; $('#secret').textContent=v.hidden?'显示 Secret':'隐藏 Secret' };

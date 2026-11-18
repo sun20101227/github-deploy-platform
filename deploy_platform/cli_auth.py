@@ -9,7 +9,10 @@ def run(*args):
     except (OSError, subprocess.TimeoutExpired):
         raise RuntimeError('无法调用 gh；请用运行服务的用户安装并登录 GitHub CLI') from None
     if result.returncode:
-        raise RuntimeError('gh 未登录或授权已失效，请在服务器运行 gh auth login --hostname github.com')
+        # gh's own first line says what is wrong (not logged in, token expired, network); keep it.
+        detail = next((line.strip() for line in (result.stderr or '').splitlines() if line.strip()), '')
+        raise RuntimeError('gh 未登录或授权已失效，请在服务器运行 gh auth login --hostname github.com'
+                           + (f'。gh 的提示：{detail[:300]}' if detail else ''))
     return result.stdout.strip()
 
 
