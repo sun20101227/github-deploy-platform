@@ -424,6 +424,36 @@ def rollback_project(project_id: int):
         raise HTTPException(409, str(exc)) from exc
 
 
+@app.post("/api/projects/{project_id}/restart")
+def restart_project(project_id: int):
+    """Restart the running version only: no fetch, no build."""
+    project = project_detail(project_id)
+    return {"deployment_id": deploy(project_id, account={}, project=project, action="restart"), "status": "queued"}
+
+
+@app.get("/api/projects/status")
+def projects_status():
+    """Service state of every project, for the project list."""
+    with db.connect() as conn:
+        rows = [dict(r) for r in conn.execute("SELECT * FROM projects")]
+    return {str(p['id']): {k: v for k, v in runtimes.status(p).items() if k in ('state', 'detail')} for p in rows}
+
+
+@app.get("/api/projects/{project_id}/status")
+def project_status(project_id: int):
+    return runtimes.status(project_detail(project_id))
+
+
+@app.get("/api/projects/{project_id}/logs")
+def project_logs(project_id: int, lines: int = Query(200, ge=20, le=2000)):
+    try:
+        return runtimes.logs(project_detail(project_id), lines)
+    except RuntimeError as exc:
+        raise HTTPException(400, str(exc)) from None
+    except Exception:
+        raise HTTPException(502, '读取服务日志失败：Docker 或 journalctl 不可用') from None
+
+
 @app.get("/api/projects/{project_id}/deployments")
 def deployments(project_id: int, limit: int = Query(50, ge=1, le=200)):
     with db.connect() as conn:

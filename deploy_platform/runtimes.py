@@ -2,6 +2,7 @@
 import json
 import re
 import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 
 from python_on_whales import DockerClient
@@ -101,3 +102,93 @@ def restart(project, target):
             raise RuntimeError(f'{unit} 重启后未处于运行状态，请查看 journalctl -u {unit}') from None
         return True
     return False
+
+
+# ---- Is it running, and what is it printing? Read only. ----
+
+def _compose_containers(name):
+    import docker
+    client = docker.from_env(timeout=5)
+    try:
+        return client, client.containers.list(all=True, filters={'label': f'com.docker.compose.project={name}'})
+    except Exception:
+        client.close()
+        raise
+
+
+def _healthy(url):
+    import httpx
+    try:
+        return 200 <= httpx.get(url, timeout=2, follow_redirects=False).status_code < 300
+    except httpx.HTTPError:
+        return False
+
+
+def status(project):
+    """{'state': running|degraded|stopped|unknown, 'detail': text, 'items': [...], 'health': True/False/None}."""
+    settings = json.loads(project.get('runtime_config') or '{}')
+    runtime = project.get('runtime', 'command')
+    items, note = [], ''
+    try:
+        if runtime == 'compose' and settings.get('project'):
+            client, containers = _compose_containers(settings['project'])
+            try:
+                for c in containers:
+                    state = c.attrs.get('State', {})
+                    items.append({'name': c.name, 'state': c.status, 'health': (state.get('Health') or {}).get('Status', ''),
+                                  'since': state.get('StartedAt', '') if c.status == 'running' else state.get('FinishedAt', ''),
+                                  'restarts': c.attrs.get('RestartCount', 0)})
+            finally:
+                client.close()
+        elif runtime == 'systemd' and settings.get('unit'):
+            props = ['systemctl', 'show', settings['unit'], '--property=ActiveState,SubState,ActiveEnterTimestamp,NRestarts']
+            # "@1731890000" instead of "Wed 2026-11-18 00:33:18 CST", so the page can say "3 小时前"
+            r = subprocess.run(props + ['--timestamp=unix'], capture_output=True, text=True, timeout=5)
+            if r.returncode:  # systemd older than 247
+                r = subprocess.run(props, capture_output=True, text=True, timeout=5)
+            data = dict(line.split('=', 1) for line in r.stdout.splitlines() if '=' in line)
+            active = data.get('ActiveState', 'unknown')
+            since = data.get('ActiveEnterTimestamp', '')
+            if since.startswith('@') and since[1:].isdigit():
+                since = datetime.fromtimestamp(int(since[1:]), timezone.utc).isoformat()
+            items.append({'name': settings['unit'], 'state': 'running' if active == 'active' else active,
+                          'health': data.get('SubState', ''), 'since': since,
+                          'restarts': int(data.get('NRestarts') or 0)})
+    except Exception:
+        note = 'Docker 未运行或当前用户无访问权限' if runtime == 'compose' else '读不到服务状态'
+    health = _healthy(project['healthcheck_url']) if project.get('healthcheck_url') else None
+    if items:
+        running = [i for i in items if i['state'] == 'running' and i['health'] not in ('unhealthy',)]
+        state = 'running' if len(running) == len(items) else 'degraded' if running else 'stopped'
+    elif note:
+        state = 'unknown'
+    elif runtime == 'compose':
+        state, note = 'stopped', '没有找到这个 Compose 项目的容器'
+    else:
+        # A custom command leaves nothing to look at; the health check is the only signal.
+        state = 'unknown' if health is None else 'running' if health else 'stopped'
+        note = '自定义命令的项目只能通过健康检查判断' if health is None else ''
+    if state == 'running' and health is False:
+        state, note = 'degraded', '进程在运行，但健康检查没有通过'
+    return {'state': state, 'detail': note, 'items': items, 'health': health}
+
+
+def logs(project, lines=200):
+    """Recent output of the service itself (not of deployments)."""
+    settings = json.loads(project.get('runtime_config') or '{}')
+    runtime = project.get('runtime', 'command')
+    if runtime == 'systemd' and settings.get('unit'):
+        r = subprocess.run(['journalctl', '-u', settings['unit'], '-n', str(lines), '--no-pager', '-o', 'short-iso'],
+                           capture_output=True, text=True, timeout=15)
+        return {'source': f"journalctl -u {settings['unit']}", 'text': r.stdout or r.stderr or '没有日志'}
+    if runtime == 'compose' and settings.get('project'):
+        client, containers = _compose_containers(settings['project'])
+        try:
+            parts = []
+            for c in sorted(containers, key=lambda c: c.name):
+                text = c.logs(tail=lines, timestamps=True).decode('utf-8', errors='replace')
+                parts.append(f'== {c.name} ==\n{text}' if len(containers) > 1 else text)
+        finally:
+            client.close()
+        return {'source': f"docker compose -p {settings['project']} logs", 'text': '\n'.join(parts) or '没有日志'}
+    raise RuntimeError('自定义命令的项目看不到服务日志：平台不知道它把输出写到了哪里')

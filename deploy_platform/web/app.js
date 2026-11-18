@@ -3,7 +3,10 @@
 const $ = s => document.querySelector(s);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const stateNames = {queued:'排队中',running:'部署中',succeeded:'已完成',failed:'失败',rolled_back:'已恢复旧版',rollback_failed:'回滚失败'};
-const actionNames = {deploy:'部署',update:'更新',rollback:'回滚',webhook:'自动更新',import:'接入'};
+const actionNames = {deploy:'部署',update:'更新',rollback:'回滚',webhook:'自动更新',import:'接入',restart:'重启'};
+// 服务本身的状态（和部署任务的状态分开）：样式借用部署状态的几种颜色
+const SVC = {running:['succeeded','运行中'], degraded:['rolled_back','部分异常'], stopped:['failed','已停止'], unknown:['none','状态未知']};
+const svcBadge = s => `<span class="badge ${SVC[s]?.[0]||'none'}">${SVC[s]?.[1]||'状态未知'}</span>`;
 const ACTIVE = ['queued','running'];
 let epoch = 0, poll;
 let selectedJob = {project:0, job:0};   // 部署记录里选中的任务，轮询刷新时保持不变
@@ -67,8 +70,8 @@ const BAD_LINES = /失败|未通过|中断|无法|超过|不符合|已改变|已
 function stepsFor(project, job){
   if(!job || job.action==='import') return '';
   // A project that is not a Git checkout has no fetch step: the platform only builds and restarts.
-  const names = project.mode==='external' ? [] : [job.action==='rollback' ? '准备旧版本' : '拉取代码'];
-  if(project.build_command) names.push('构建');
+  const names = project.mode==='external' || job.action==='restart' ? [] : [job.action==='rollback' ? '准备旧版本' : '拉取代码'];
+  if(project.build_command && job.action!=='restart') names.push('构建');
   names.push(project.healthcheck_url ? '重启并检查健康' : '重启服务');
   const msg = job.message || '';
   let reached = job.status==='queued' ? -1 : 0;
@@ -96,6 +99,50 @@ function runtimeText(p){
   return `自定义命令<br><code>${esc(p.start_command || '—')}</code>`;
 }
 
+/* ---- 服务：状态、重启、服务日志 ---- */
+let logsOpen = 0;   // 正在看哪个项目的服务日志；概览自动刷新时保持打开
+const STATE_NAMES = {running:'运行中', exited:'已退出', restarting:'正在重启', paused:'已暂停', created:'未启动', dead:'已停止',
+  failed:'失败', inactive:'未运行', activating:'正在启动', deactivating:'正在停止', reloading:'正在重载'};
+function since(v){
+  if(!v || v.startsWith('0001-')) return '';
+  const iso = v.replace(/\.(\d{3})\d*/,'.$1');   // Docker 的时间带 9 位小数，浏览器解析不了
+  return isNaN(new Date(iso)) ? v : ago(iso);
+}
+async function serviceCard(p, id, active, t){
+  let s;
+  try { s = await api(`/api/projects/${id}/status`) } catch(e) { s = {state:'unknown', detail:e.message, items:[], health:null} }
+  const card = $('#svc'); if(t!==epoch || !card) return;
+  const canLogs = p.runtime==='compose' || p.runtime==='systemd';
+  card.innerHTML = `<h2>服务 ${svcBadge(s.state)}</h2>${s.detail?`<p class="state-line">${esc(s.detail)}</p>`:''}
+    ${s.items.length?`<ul class="svc-list">${s.items.map(i=>`<li><span class="svc-dot ${i.state==='running'&&i.health!=='unhealthy'?'running':i.state==='running'?'degraded':'stopped'}"></span><strong>${esc(i.name)}</strong><span>${esc(STATE_NAMES[i.state]||i.state)}${i.health&&i.health!=='running'?' · '+esc(i.health==='healthy'?'健康':i.health==='unhealthy'?'不健康':i.health):''}${since(i.since)?` · ${i.state==='running'?'启动于':'停止于'} ${esc(since(i.since))}`:''}${i.restarts?` · 重启过 ${i.restarts} 次`:''}</span></li>`).join('')}</ul>`:''}
+    ${s.health===null?'':`<p class="state-line">健康检查 ${s.health?'<span class="badge succeeded">通过</span>':'<span class="badge failed">未通过</span>'} <small>${esc(p.healthcheck_url)}</small></p>`}
+    <div class="buttons"><button id="svc-restart" ${active?'disabled':''}>重启服务</button>${canLogs?`<button id="svc-logs-btn" aria-expanded="${logsOpen===id}">${logsOpen===id?'收起日志':'查看服务日志'}</button>`:''}<button class="text" id="svc-refresh">刷新状态</button></div><div id="svc-logs"></div>`;
+  $('#svc-refresh').onclick = ()=>serviceCard(p, id, active, t);
+  $('#svc-restart').onclick = async e=>{
+    const btn = e.currentTarget;
+    if(!await confirmAction('重启服务','只重启正在运行的版本，不拉代码、不构建。服务会短暂中断。','重启')) return;
+    busy(btn,async()=>{
+      const r = await api(`/api/projects/${id}/restart`,{});
+      selectedJob = {project:id, job:r.deployment_id};
+      location.hash = `/project/${id}/history`;
+    });
+  };
+  const logsBtn = $('#svc-logs-btn');
+  if(logsBtn) logsBtn.onclick = ()=>{ logsOpen = logsOpen===id ? 0 : id; serviceCard(p, id, active, t) };
+  if(logsOpen===id) loadLogs(id, t);
+}
+async function loadLogs(id, t){
+  const box = $('#svc-logs'); if(!box) return;
+  box.innerHTML = '<p class="state-line"><span class="spinner" aria-hidden="true"></span>正在读取日志…</p>';
+  try {
+    const d = await api(`/api/projects/${id}/logs?lines=300`);
+    if(t!==epoch || !box.isConnected) return;
+    box.innerHTML = `<div class="log-head"><h3>最近 300 行</h3><span><code>${esc(d.source)}</code> <button class="text" id="logs-reload">重新读取</button></span></div><pre class="terminal" id="svc-log" tabindex="0" aria-label="服务日志">${esc(d.text)}</pre>`;
+    const pre = $('#svc-log'); pre.scrollTop = pre.scrollHeight;
+    $('#logs-reload').onclick = ()=>loadLogs(id, t);
+  } catch(e) { if(box.isConnected) box.innerHTML = `<p class="error">${esc(e.message)}</p>` }
+}
+
 /* ---- 项目列表 ---- */
 async function projectsPage(t){
   const projects = await api('/api/projects');
@@ -114,11 +161,18 @@ async function projectsPage(t){
     const q = ($('#search')?.value||'').toLowerCase();
     const list = rows.filter(p=>(p.repository+' '+p.branch).toLowerCase().includes(q));
     $('#project-list').innerHTML = list.map((p,i)=>`<a class="project-row" style="--i:${i}" href="#/project/${p.id}">
-      <div><strong>${esc(p.repository.split('/').pop())}${p.mode==='existing'||p.mode==='external'?'<span class="kind">已接入</span>':''}</strong><small>${esc(p.repository)} · ${esc(p.branch)}</small></div>
+      <div><strong><span class="svc-dot ${svc[p.id]?.state||'loading'}" data-svc="${p.id}" title="${esc(svcTitle(svc[p.id]))}"></span>${esc(p.repository.split('/').pop())}${p.mode==='existing'||p.mode==='external'?'<span class="kind">已接入</span>':''}</strong><small>${esc(p.repository)} · ${esc(p.branch)}</small></div>
       <div>${badge(p.job?.status)}</div><span class="when">${p.job ? when(p.job.finished_at || p.job.started_at) : '尚未部署'}</span>
       <code class="commit">${esc(p.job?.commit_sha?.slice(0,8)||'—')}</code><span class="arrow" aria-hidden="true">↗</span></a>`).join('') || '<div class="empty">没有匹配的项目</div>';
   }
+  let svc = {};
+  const svcTitle = s => s ? `服务${SVC[s.state]?.[1]||'状态未知'}${s.detail?'：'+s.detail:''}` : '正在读取服务状态';
   if(projects.length){ $('#search').value = query; render(); $('#search').oninput = render }
+  // 服务状态要问 Docker 和 systemd，稍慢一点：先显示列表，读到后只更新每行前面的圆点
+  if(projects.length) api('/api/projects/status').then(s=>{
+    if(t!==epoch) return; svc = s;
+    document.querySelectorAll('[data-svc]').forEach(el=>{ const v = s[el.dataset.svc]; el.className = 'svc-dot ' + (v?.state||'unknown'); el.title = svcTitle(v) });
+  }).catch(()=>{});
   if(active) poll = setTimeout(()=>{ if(epoch===t) projectsPage(t).catch(()=>{}) }, 4000);
 }
 
@@ -166,7 +220,8 @@ async function projectPage(id,tab,t){
   const [p,jobs] = await Promise.all([api(`/api/projects/${id}`),api(`/api/projects/${id}/deployments`)]);
   if(t!==epoch) return;
   const last = jobs[0], active = jobs.find(j=>ACTIVE.includes(j.status));
-  const current = jobs.find(j=>j.status==='succeeded');
+  // A restart keeps the version; "deployed at" should still show when that version went out.
+  const current = jobs.find(j=>j.status==='succeeded' && j.action!=='restart') || jobs.find(j=>j.status==='succeeded');
   const root = `#/project/${id}`;
   const validTab = ['overview','history','settings'].includes(tab) ? tab : 'overview';
   const existing = p.mode==='existing', external = p.mode==='external';
@@ -192,6 +247,7 @@ async function projectPage(id,tab,t){
     const canRollback = !!(current?.previous_release || current?.previous_commit) && !active;
     body.innerHTML = `<div class="split"><div>
       ${active ? `<section class="card hero new"><h2>正在${actionNames[active.action]||'部署'} · #${active.id}</h2>${stepsFor(p,active)}<p class="state-line"><span class="spinner" aria-hidden="true"></span>已进行 ${took(active)}，完成后自动刷新。</p><a class="button" href="${root}/history">查看输出</a></section>` : ''}
+      <section class="card" id="svc"><h2>服务</h2><p class="state-line"><span class="spinner" aria-hidden="true"></span>正在读取服务状态…</p></section>
       <section class="card"><h2>当前版本</h2><dl class="kv"><dt>提交</dt><dd>${current ? sha(p.repository,current.commit_sha,12) : '<span class="muted">尚未部署</span>'}</dd><dt>分支</dt><dd>${esc(p.branch)}</dd><dt>部署时间</dt><dd>${current ? `${when(current.finished_at)} <small>· ${esc(stamp(current.finished_at))}</small>` : '—'}</dd><dt>最近任务</dt><dd>${badge(last?.status)}${last && last!==current ? ` <small>${when(last.started_at)}</small>` : ''}</dd></dl>
         <div class="buttons"><button id="check">检查更新</button><button id="rollback" ${canRollback?'':'disabled'}>回滚上一版</button></div><div id="check-result" class="settings-note" role="status"></div></section>
     </div><div class="card info"><h3>${existing?'原目录 · 已接入':external?'原目录 · 已接入（不是 Git 仓库）':'部署目录'}</h3><p class="mono">${esc(p.deploy_root)}</p><h3>重启方式</h3><p>${runtimeText(p)}</p><h3>健康检查</h3><p class="muted">${esc(p.healthcheck_url||'未配置')}${p.healthcheck_url?` <small>· 最长 ${esc(p.healthcheck_timeout||45)} 秒</small>`:''}</p></div></div>`;
@@ -210,6 +266,7 @@ async function projectPage(id,tab,t){
         location.hash = `/project/${id}/history`;
       });
     };
+    serviceCard(p, id, !!active, t);
   }
 
   if(validTab==='history'){

@@ -153,6 +153,14 @@ GET /api/projects/{project_id}/check
 - `current_sha` 是最近一次部署成功的提交。还没部署成功过，或目录不是 Git 仓库（看不出正在运行哪个提交）时，这里是空字符串。
 - `available` 表示两者不同，即有新提交可以部署。
 
+#### 只重启服务
+
+```http
+POST /api/projects/{project_id}/restart
+```
+
+按项目的重启方式重启正在运行的版本，不拉代码、不构建，然后做健康检查。返回格式和触发部署相同，部署记录里的 `action` 为 `restart`。这条记录沿用当前版本的提交和回滚信息，所以“检查有没有新提交”和回滚都不受影响。还没部署成功过的新建项目会失败。
+
 ### 2.4 查询部署结果
 
 ```http
@@ -181,12 +189,12 @@ GET /api/projects/{project_id}/deployments?limit=50
 
 | 字段 | 说明 |
 |---|---|
-| `action` | `deploy` 手动或接口触发，`webhook` 推送触发，`rollback` 回滚，`import` 接入时的登记记录 |
+| `action` | `deploy` 手动或接口触发，`webhook` 推送触发，`rollback` 回滚，`restart` 只重启，`import` 接入时的登记记录 |
 | `status` | 见下表 |
 | `commit_sha` | 这次部署的提交；目录不是 Git 仓库的项目为空 |
 | `release_dir` | 这次运行代码的目录 |
 | `previous_release` / `previous_commit` | 回滚会用到的上一版本，前者用于新建项目，后者用于 Git 接入的项目 |
-| `message` | 执行过程：平台写的步骤行，加上构建输出和失败原因的最后一段。只能给人看，不要解析它判断结果 |
+| `message` | 执行过程：平台写的步骤行、构建和重启命令的输出、失败原因。命令运行时每半秒左右追加一次，进行中轮询就能看到实时输出；最多保留最后 60000 个字符。只能给人看，不要解析它判断结果 |
 
 | `status` | 是否结束 | 含义 |
 |---|---|---|
@@ -356,6 +364,35 @@ POST /api/projects/import
 
 返回 `{"id": 7}`。接入只登记，不会改代码，也不会重启服务。
 
+#### 服务状态与服务日志
+
+```http
+GET /api/projects/{project_id}/status
+```
+
+```json
+{
+  "state": "running",
+  "detail": "",
+  "health": true,
+  "items": [
+    {"name": "sub2api", "state": "running", "health": "healthy", "since": "2026-11-14T07:07:59.1Z", "restarts": 0}
+  ]
+}
+```
+
+- **`state`**：`running` 全部在运行，`degraded` 部分在运行或健康检查没通过，`stopped` 都没在运行，`unknown` 读不到。
+- **`items`**：Compose 项目每个容器一项，systemd 是那个服务一项；自定义命令的项目为空，只能靠健康检查判断。
+- **`health`**：配置了健康检查时是这次检查的结果，没配置时为 `null`。
+
+`GET /api/projects/status` 一次返回所有项目，格式为 `{"<项目 ID>": {"state": "...", "detail": "..."}}`。
+
+```http
+GET /api/projects/{project_id}/logs?lines=200
+```
+
+返回服务自己的输出（不是部署记录）：`{"source": "journalctl -u xxx.service", "text": "..."}`。`lines` 取 20–2000。Compose 项目每个容器的日志前面有 `== 容器名 ==`。自定义命令的项目看不到服务日志，返回 `400`。
+
 ### 2.6 Webhook
 
 ```http
@@ -519,5 +556,4 @@ print(r.json())
 - **同一项目串行**：同一项目的部署和回滚一次只跑一个；不同项目可以同时部署。
 - **平台重启会中断任务**：被中断的任务在平台启动时标记为 `failed`。服务可能停在中间状态，请检查后重新部署。
 - **补跑标记只在内存里**：部署中收到推送后要补跑的标记，平台重启后会丢失，需要再推送一次或手动部署。
-- **没有逐行实时日志**：构建输出在命令结束后才写进 `message`。
 - **没有接口版本号**：接口和字段有变化时，会同步更新这份文档。

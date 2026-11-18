@@ -156,6 +156,23 @@ footer span{padding:0 8px}
 .arrow{color:var(--faint);transition:transform 160ms var(--ease),color 150ms}
 .kind{display:inline-block;margin-left:8px;padding:0 7px;border:1px solid var(--line-strong);border-radius:var(--r-sm);font:400 11px/1.6 var(--sans);color:var(--muted);vertical-align:2px}
 
+/* ---- 服务状态圆点与列表 ---- */
+.svc-dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:8px;vertical-align:2px;background:var(--faint);flex:none}
+.svc-dot.running{background:var(--ok);box-shadow:0 0 0 3px var(--ok-soft)}
+.svc-dot.degraded{background:var(--warn);box-shadow:0 0 0 3px var(--warn-soft)}
+.svc-dot.stopped{background:var(--danger);box-shadow:0 0 0 3px var(--danger-soft)}
+.svc-dot.loading{animation:pulse 1.4s ease-in-out infinite}
+#svc h2{display:flex;align-items:center;gap:10px}
+#svc h2 .badge{font:500 12px/1.6 var(--sans)}
+.svc-list{list-style:none;margin:4px 0 16px;padding:0;display:grid;gap:8px}
+.svc-list li{display:flex;align-items:center;flex-wrap:wrap;gap:4px 0;font-size:13px}
+.svc-list strong{font-weight:600;color:var(--ink);margin-right:10px;font-family:var(--mono);font-size:12px}
+.svc-list span:last-child{color:var(--muted)}
+#svc-logs:not(:empty){margin-top:8px}
+#svc-logs .log-head{flex-wrap:wrap;margin-top:12px}
+#svc-logs .log-head h3{white-space:nowrap}
+#svc-logs .log-head code{overflow-wrap:anywhere}
+
 /* ---- 页签：选中项下面一道主色 ---- */
 .tabs{display:flex;gap:26px;border-bottom:1px solid var(--line);margin-bottom:26px;overflow-x:auto;scrollbar-width:none}
 .tabs a{padding:10px 0 9px;color:var(--muted);border-bottom:2px solid transparent;white-space:nowrap;transition:color 150ms,border-color 150ms}

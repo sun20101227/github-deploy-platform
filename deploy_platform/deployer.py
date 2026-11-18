@@ -1,7 +1,9 @@
 """Prepare releases separately; serialize activation and restore the last service on failure."""
 import base64
+import functools
 import os
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -43,11 +45,68 @@ def _prune(root, keep):
             removed += 1
     return removed
 
-def _run(args, *, cwd=None, env=None, timeout=900):
-    r = subprocess.run(args, cwd=cwd, env=env, capture_output=True, text=True, timeout=timeout)
-    if r.returncode:
-        raise DeploymentError((r.stderr or r.stdout or '命令执行失败')[-1600:])
-    return r.stdout.strip()
+LOG_LIMIT = 60000  # characters of output kept per deployment record
+
+
+def _append(job, text):
+    with db.connect() as c:
+        c.execute("UPDATE deployments SET message=substr(message || ?, -?) WHERE id=?", (text, LOG_LIMIT, job))
+
+
+def _kill(proc):
+    try:
+        if os.name == 'nt':
+            proc.kill()
+        else:
+            os.killpg(proc.pid, signal.SIGKILL)  # the shell and everything it started
+    except (OSError, ProcessLookupError):
+        pass
+
+
+def _run(args, *, cwd=None, env=None, timeout=900, job=None):
+    """Run a command. With job, its output goes into that deployment record line by line while it
+    runs (the console polls it), and nothing is returned; without, the output is returned."""
+    if job is None:
+        r = subprocess.run(args, cwd=cwd, env=env, capture_output=True, text=True, timeout=timeout)
+        if r.returncode:
+            raise DeploymentError((r.stderr or r.stdout or '命令执行失败')[-1600:])
+        return r.stdout.strip()
+    proc = subprocess.Popen(args, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True, errors='replace', start_new_session=os.name != 'nt')
+    lines, guard = [], threading.Lock()
+
+    def read():
+        for line in proc.stdout:
+            with guard:
+                lines.append(line)
+
+    reader = threading.Thread(target=read, daemon=True)
+    reader.start()
+
+    def flush(final=False):
+        with guard:
+            chunk = ''.join(lines)
+            lines.clear()
+        if final and chunk and not chunk.endswith('\n'):
+            chunk += '\n'
+        if chunk:
+            _append(job, chunk)
+
+    deadline = time.monotonic() + timeout
+    while proc.poll() is None:
+        if time.monotonic() > deadline:
+            _kill(proc)
+            proc.wait()
+            reader.join(2)
+            flush(final=True)
+            raise DeploymentError(f'命令超过 {timeout // 60} 分钟没有结束，已停止')
+        time.sleep(0.5)
+        flush()
+    reader.join(5)
+    flush(final=True)
+    if proc.returncode:
+        raise DeploymentError(f'命令失败（退出码 {proc.returncode}），输出见上方')
+    return ''
 
 def _current_release(root):
     p = root / 'current'
@@ -67,14 +126,14 @@ def _healthy(url):
     except httpx.HTTPError:
         return False
 
-def _start(project, target):
+def _start(project, target, job=None):
     env = os.environ.copy()
     env['DEPLOY_RELEASE_DIR'] = str(target)
     env['DEPLOY_PROJECT_ROOT'] = project['deploy_root']
     if not runtimes.restart(project, target):
         command = project['start_command']
         # An app's own updater (e.g. systemctl start qiyu-updater) can build for several minutes.
-        _run(['cmd', '/c', command] if os.name == 'nt' else ['sh', '-c', command], cwd=target, env=env, timeout=1800)
+        _run(['cmd', '/c', command] if os.name == 'nt' else ['sh', '-c', command], cwd=target, env=env, timeout=1800, job=job)
     url = project.get('healthcheck_url')
     if url:
         wait = int(project.get('healthcheck_timeout') or 45)
@@ -154,11 +213,9 @@ def _external(job, project, action):
         if project['build_command']:
             _note(job,'执行构建')
             cmd = project['build_command']
-            output = _run(['cmd','/c',cmd] if os.name=='nt' else ['sh','-c',cmd],cwd=root,timeout=1800)
-            if output:
-                _note(job,output[-4000:])
+            _run(['cmd','/c',cmd] if os.name=='nt' else ['sh','-c',cmd],cwd=root,timeout=1800,job=job)
         _note(job,'重启服务并检查状态')
-        _start(project,root)
+        _start(project,root,job)
         _note(job,'更新与重启完成')
         status = 'succeeded'
     except Exception as exc:
@@ -167,13 +224,44 @@ def _external(job, project, action):
     with db.connect() as c:
         c.execute('UPDATE deployments SET status=?,finished_at=? WHERE id=?',(status,db.now(),job))
 
+def _restart_only(job, project):
+    """Restart the running version without touching code. Keeps the version fields of the last
+    successful deployment, so "check for updates" and rollback still see the same version."""
+    root = Path(project['deploy_root']).resolve()
+    status = 'failed'
+    try:
+        with db.connect() as c:
+            last = c.execute("SELECT commit_sha,release_dir,previous_release,previous_commit FROM deployments "
+                             "WHERE project_id=? AND status='succeeded' AND action<>'restart' ORDER BY id DESC LIMIT 1",(project['id'],)).fetchone()
+            last = dict(last) if last else {'commit_sha':'','release_dir':'','previous_release':'','previous_commit':''}
+            c.execute("UPDATE deployments SET status='running',commit_sha=?,release_dir=?,previous_release=?,previous_commit=? WHERE id=?",
+                      (last['commit_sha'],last['release_dir'],last['previous_release'],last['previous_commit'],job))
+        if project.get('mode') in ('existing','external'):
+            target = root
+        else:
+            current = _current_release(root)
+            if not current:
+                raise DeploymentError('还没有部署成功过，没有可以重启的版本')
+            target = Path(current)
+        _note(job,'重启服务并检查状态')
+        _start(project,target,job)
+        _note(job,'服务已重启' + ('，健康检查通过' if project.get('healthcheck_url') else ''))
+        status = 'succeeded'
+    except Exception as exc:
+        _note(job,str(exc) if isinstance(exc,RuntimeError) else '重启失败，请查看服务日志')
+    with db.connect() as c:
+        c.execute('UPDATE deployments SET status=?,finished_at=? WHERE id=?',(status,db.now(),job))
+
 def _execute(job, account, project, action):
+    if action == 'restart':
+        _restart_only(job, project)
+        return
     if project.get('mode') == 'external':
         _external(job, project, action)
         return
     if project.get('mode') == 'existing':
         try:
-            existing.execute(job,account,project,action,_note,_start,_run)
+            existing.execute(job,account,project,action,_note,functools.partial(_start,job=job),functools.partial(_run,job=job))
         except Exception:
             _note(job,'无法读取已有项目目录')
             with db.connect() as c:
@@ -207,15 +295,14 @@ def _execute(job, account, project, action):
             if project['build_command']:
                 _note(job,'执行构建')
                 cmd=project['build_command']
-                output=_run(['cmd','/c',cmd] if os.name=='nt' else ['sh','-c',cmd],cwd=target,timeout=1800)
-                _note(job,output[-4000:])
+                _run(['cmd','/c',cmd] if os.name=='nt' else ['sh','-c',cmd],cwd=target,timeout=1800,job=job)
         sha=_run(['git','rev-parse','HEAD'],cwd=target)
         with db.connect() as c:
             c.execute('UPDATE deployments SET release_dir=?,commit_sha=? WHERE id=?',(str(target),sha,job))
         _note(job,'切换版本，启动服务')
         _pointer(root,target)
         activated=True
-        _start(project,target)
+        _start(project,target,job)
         _note(job,'健康检查通过' if project.get('healthcheck_url') else '服务已重启（未配置健康检查）')
         with db.connect() as c:
             c.execute("UPDATE deployments SET status='succeeded',finished_at=? WHERE id=?",(db.now(),job))
@@ -233,7 +320,7 @@ def _execute(job, account, project, action):
             try:
                 _pointer(root,previous)
                 if previous:
-                    _start(project,Path(previous))
+                    _start(project,Path(previous),job)
                     status='rolled_back'
                     _note(job,'已恢复上一版本并重新启动')
                 else:
